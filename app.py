@@ -86,7 +86,12 @@ with st.spinner("Fetching NetCDF…"):
     ds = open_year(url)
 
 # pick the requested month
-da = ds[vname].isel(time=mon-1)
+var_key = vname.upper() # <-- case-insensitive lookup
+if var_key not in ds.variables:
+  st.error(f"Variable {var_key} not found in file!")
+  st.stop()
+
+da = ds[var_key].isel(time=mon-1)
 
 # pressure-level slicing
 if plevel is not None:
