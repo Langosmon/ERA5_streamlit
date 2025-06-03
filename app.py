@@ -2,6 +2,9 @@
 import xarray as xr
 import streamlit as st
 import plotly.express as px
+import numpy as np
+import cartopy.feature as cfeature
+import plotly.graph_objects as go
 
 st.set_page_config(layout="wide")
 YEARS = list(range(1980, 2023))                      # RDA stops at 2022
@@ -56,6 +59,8 @@ mon  = st.sidebar.selectbox("Month", list(range(1,13)),
                             format_func=lambda m: ["Jan","Feb","Mar","Apr","May",
                                                    "Jun","Jul","Aug","Sep","Oct",
                                                    "Nov","Dec"][m-1])
+
+show_coast = st.sidebar.checkbox("Show coastlines", value=True)
 
 # ─────────────────────────────────────────────────────────────────────────────
 #  URL BUILDER
@@ -120,6 +125,35 @@ if vname in {"sp", "msl"}:                   # Pa → hPa
 # ─────────────────────────────────────────────────────────────────────────────
 #  PLOT
 # ─────────────────────────────────────────────────────────────────────────────
+##### Cached helper for coastlines
+@st.cache_resource(show_spinner=False)
+def coastlines_trace(res="110m"):
+    """Return a Plotly Scatter trace with Natural-Earth coastlines."""
+    feat = cfeature.NaturalEarthFeature(
+        "physical", "coastline", res, edgecolor="black", facecolor="none"
+    )
+
+    xs, ys = [], []
+    for geom in feat.geometries():
+        # Each geometry can be MultiLineString or LineString → iterate over coords
+        for line in getattr(geom, "geoms", [geom]):
+            lon, lat = line.coords.xy
+            # Shift −180…180 → 0…360 so it matches ERA5 grid
+            lon = np.mod(lon, 360)
+            xs.extend(lon.tolist() + [np.nan])
+            ys.extend(lat.tolist() + [np.nan])
+
+    return go.Scatter(
+        x=xs,
+        y=ys,
+        mode="lines",
+        line=dict(color="black", width=0.8),
+        hoverinfo="skip",
+        showlegend=False,
+    )
+
+
+
 title = f"{choice} • {mon:02d}/{yr}" + (f" • {plevel} hPa" if plevel else "")
 fig = px.imshow(
     da,
@@ -128,5 +162,8 @@ fig = px.imshow(
     labels=dict(color=units),
     title=title
 )
+
+if show_coast:
+  fig.add_trace(coastlines_trace())
 st.plotly_chart(fig, use_container_width=True)
 
