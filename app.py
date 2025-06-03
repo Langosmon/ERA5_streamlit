@@ -127,21 +127,31 @@ if vname in {"sp", "msl"}:                   # Pa → hPa
 # ─────────────────────────────────────────────────────────────────────────────
 ##### Cached helper for coastlines
 @st.cache_resource(show_spinner=False)
-def coastlines_trace(res="110m"):
-    """Return a Plotly Scatter trace with Natural-Earth coastlines."""
+def coastlines_trace(res="110m", gap_deg=10):
+    """
+    Return a Plotly Scatter trace with Natural-Earth coastlines.
+    Inserts NaNs whenever |Δlon| > `gap_deg` to prevent wrap-around lines.
+    """
     feat = cfeature.NaturalEarthFeature(
-        "physical", "coastline", res, edgecolor="black", facecolor="none"
+        "physical", "coastline", res,
+        edgecolor="black", facecolor="none"
     )
 
     xs, ys = [], []
     for geom in feat.geometries():
-        # Each geometry can be MultiLineString or LineString → iterate over coords
+        # Support both LineString and MultiLineString
         for line in getattr(geom, "geoms", [geom]):
             lon, lat = line.coords.xy
-            # Shift −180…180 → 0…360 so it matches ERA5 grid
-            lon = np.mod(lon, 360)
-            xs.extend(lon.tolist() + [np.nan])
-            ys.extend(lat.tolist() + [np.nan])
+            lon = np.mod(lon, 360)  # shift into 0…360° East
+            xs.append(np.nan)       # ensure a break before each sub-line
+            ys.append(np.nan)
+            for i in range(len(lon)):
+                xs.append(lon[i])
+                ys.append(lat[i])
+                if i < len(lon) - 1 and abs(lon[i+1] - lon[i]) > gap_deg:
+                    # big jump → break the polyline
+                    xs.append(np.nan)
+                    ys.append(np.nan)
 
     return go.Scatter(
         x=xs,
@@ -151,6 +161,7 @@ def coastlines_trace(res="110m"):
         hoverinfo="skip",
         showlegend=False,
     )
+
 
 
 
