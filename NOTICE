@@ -1,0 +1,14 @@
+NOTICE
+
+This software is developed and maintained by Jose A. Ocegueda Sanchez <jocegue@purdue.edu>.
+
+If you use this repository, even in part or as a reference, please cite the original work:
+
+ERA5 Streamlit – https://github.com/Langosmon/ERA5_streamlit
+
+Attribution to this work is requested in any derivative works, academic publications, project documentation, or public distribution.
+
+This project may include components or ideas inspired by third-party sources. If such content is used, users are encouraged to also credit those original authors appropriately.
+
+Copyright © 2025 Jose A. Ocegueda Sanchez
+Licensed under the Apache License, Version 2.0.
