@@ -14,8 +14,7 @@ mon = st.sidebar.selectbox("Month", list(MONTHS), format_func=lambda m: MONTHS[m
 code, var = "034", "sstk"
 url = (f"https://thredds.rda.ucar.edu/thredds/dodsC/files/"
        f"g/d633001_nc/e5.moda.an.sfc/{yr}/"
-       f"e5.moda.an.sfc.128_{code}_{var}.ll025sc.{yr}{mon:02d}0100_{yr}{mon:02d}1200.nc")
-
+       f"e5.moda.an.sfc.128_{code}_{var}.ll025sc.{yr}010100_{yr}120100.nc")
 st.caption(f"Fetching ERA5 SST for {MONTHS[mon]} {yr}")
 with st.spinner("Opening NetCDF…"):
     da = xr.open_dataset(url, decode_times=False)["SSTK"][0] - 273.15
