@@ -86,12 +86,23 @@ with st.spinner("Fetching NetCDF…"):
     ds = open_year(url)
 
 # pick the requested month
-var_key = vname.upper() # <-- case-insensitive lookup
-if var_key not in ds.variables:
-  st.error(f"Variable {var_key} not found in file!")
-  st.stop()
+# ── helper ──────────────────────────────────────────────────────────────
+def find_var(ds, short):
+    """Return the first matching variable name in the Dataset."""
+    short_up = short.upper()
+    for key in (short_up, f"VAR_{short_up}", short_up.replace("10", "10M")):
+        if key in ds.variables:
+            return key
+    raise KeyError(f"No variable named {short} / VAR_{short} in file.")
 
-da = ds[var_key].isel(time=mon-1)
+# ── new extraction code ─────────────────────────────────────────────────
+try:
+    key = find_var(ds, vname)
+except KeyError as e:
+    st.error(str(e))
+    st.stop()
+
+da = ds[key].isel(time=mon-1)
 
 # pressure-level slicing
 if plevel is not None:
