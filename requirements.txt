@@ -3,3 +3,4 @@ xarray
 netCDF4
 plotly
 cartopy==0.24
+streamlit-plotly-events
