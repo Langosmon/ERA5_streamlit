@@ -155,9 +155,9 @@ fig.update_layout(
 # ── interactive plot with event capture ───────────────────────────────
 events = plotly_events(
     fig,
-    events=["plotly_relayout"],
-    override_height=700,             # choose your preferred height
-    key="era5_plot"                  # makes Streamlit treat component as stateful
+    relayout_event=True,          # ← flag instead of events=[]
+    override_height=700,
+    key="era5_plot",
 )
 
 # check if user changed the axis ranges -------------------------------
