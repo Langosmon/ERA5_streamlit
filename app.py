@@ -134,13 +134,35 @@ fig = px.imshow(
     labels=dict(color=units),
     title=title
 )
-if vmin is not None:
-    fig.update_coloraxes(cmin=vmin, cmax=vmax)
+
+fig.update_layout(
+    margin=dict(l=0,r=0,t=40,b=0),
+    uirevision="keep"   # keeps zoom/pan when Streamlit re-renders
+)
 
 if show_coast:
     fig.add_trace(coastlines_trace())
 
-fig.update_layout(margin=dict(l=0,r=0,t=40,b=0))
+# ── NEW: autoscale button ──────────────────────────────
+autoscale = st.button("Re-scale colour bar to current view")
+
+if autoscale and "xaxis" in fig.layout and fig.layout.xaxis.range:
+    # Current view limits
+    lon_min, lon_max = fig.layout.xaxis.range
+    lat_min, lat_max = fig.layout.yaxis.range
+
+    # Handle wrap-around 0↔360
+    if lon_min < 0: lon_min += 360
+    if lon_max < 0: lon_max += 360
+
+    sub = da.sel(
+        longitude=slice(lon_min, lon_max),
+        latitude=slice(lat_min, lat_max)
+    )
+    vmax = float(np.nanmax(np.abs(sub))) if show_anom else float(np.nanmax(sub))
+    vmin = -vmax if show_anom else float(np.nanmin(sub))
+    fig.update_coloraxes(cmin=vmin, cmax=vmax)
+
 st.plotly_chart(fig, use_container_width=True)
 
 
