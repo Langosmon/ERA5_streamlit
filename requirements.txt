@@ -3,4 +3,4 @@ xarray
 netCDF4
 plotly
 cartopy==0.24
-streamlit-plotly-events
+git+https://github.com/victoryhb/streamlit-plotly-events.git@master
