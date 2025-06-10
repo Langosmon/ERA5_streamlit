@@ -125,6 +125,13 @@ if show_anom:
     units += " anomaly"
 
 # ── plot ─────────────────────────────────────────────────────────────────
+# --- Initialize session_state ---
+# This acts as our app's memory for the color scale.
+if "cmin" not in st.session_state:
+    st.session_state.cmin = None
+    st.session_state.cmax = None
+
+# --- Main figure creation ---
 title = f"{choice} • {mon:02d}/{yr}" + (f" • {plevel} hPa" if plevel else "")
 if show_anom: title += " • anomaly"
 
@@ -136,42 +143,38 @@ fig = px.imshow(
     title=title
 )
 
-fig.update_layout(
-    margin=dict(l=0,r=0,t=40,b=0),
-    uirevision="keep"   # keeps zoom/pan when Streamlit re-renders
-)
+# --- Apply the stored color scale ---
+# On EVERY rerun, check if we have a custom scale and apply it immediately.
+if st.session_state.cmin is not None and st.session_state.cmax is not None:
+    fig.update_coloraxes(cmin=st.session_state.cmin, cmax=st.session_state.cmax)
 
-if show_coast:
-    fig.add_trace(coastlines_trace())
-
-from streamlit_plotly_events import plotly_events
-
-# update colorbar ──────────────
 fig.update_layout(
     margin=dict(l=0, r=0, t=40, b=0),
-    uirevision="keep"          # keeps zoom when Streamlit reruns
+    uirevision="keep"  # Keeps zoom/pan when Streamlit re-renders
 )
+
 if show_coast:
     fig.add_trace(coastlines_trace())
 
-# --- capture box-select events ------------------------------------------
+# --- Display chart and capture box-select events ---
+# This both displays the chart and listens for a selection.
 events = plotly_events(
     fig,
-    select_event=True,          # Box/Lasso selections trigger rerun
+    select_event=True,
     click_event=False,
     hover_event=False,
     override_height=700,
     key="era5_plot"
 )
 
-# --- if the user made a box selection, rescale to that area -------------
-if events:                      # list of points; len>0 means a selection
+# --- If a selection was made, update the state and rerun ---
+if events:
     xs = [pt["x"] for pt in events]
     ys = [pt["y"] for pt in events]
     lon_min, lon_max = min(xs), max(xs)
     lat_min, lat_max = min(ys), max(ys)
 
-    # wrap longitudes into 0…360 to match data array
+    # Wrap longitudes
     lon_min = (lon_min + 360) % 360
     lon_max = (lon_max + 360) % 360
 
@@ -187,10 +190,17 @@ if events:                      # list of points; len>0 means a selection
         vmax = float(np.nanmax(sub))
         vmin = float(np.nanmin(sub))
 
-    fig.update_coloraxes(cmin=vmin, cmax=vmax)
+    # **THE KEY STEP**: Don't update the figure directly.
+    # Store the new limits in session_state and force a rerun.
+    st.session_state.cmin = vmin
+    st.session_state.cmax = vmax
+    st.rerun()
 
-# --- final render -------------------------------------------------------
-st.plotly_chart(fig, use_container_width=True)
+# --- Add a button to reset the view ---
+if st.button("Reset color bar to full range"):
+    st.session_state.cmin = None
+    st.session_state.cmax = None
+    st.rerun()
 
 
 
