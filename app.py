@@ -146,47 +146,40 @@ if show_coast:
 
 from streamlit_plotly_events import plotly_events
 
-# add this right after you build 'fig' and add coastlines ──────────────
+# update colorbar ──────────────
 fig.update_layout(
     margin=dict(l=0, r=0, t=40, b=0),
-    uirevision="keep"   # remember zoom state between rerenders
+    uirevision="keep"          # preserves zoom when Streamlit reruns
 )
 
-# ── interactive plot with event capture ───────────────────────────────
-events = plotly_events(
-    fig,
-    relayout_event=True,          # ← flag instead of events=[]
-    override_height=700,
-    key="era5_plot",
-)
+if show_coast:
+    fig.add_trace(coastlines_trace())
 
-# check if user changed the axis ranges -------------------------------
-if events and "xaxis.range[0]" in events[0]:
-    lon_min = events[0]["xaxis.range[0]"]
-    lon_max = events[0]["xaxis.range[1]"]
-    lat_min = events[0]["yaxis.range[0]"]
-    lat_max = events[0]["yaxis.range[1]"]
+# ── AUTOSCALE BUTTON ───────────────────────────────────────────
+if st.button("Re-scale colour bar to current view"):
+    if "xaxis" in fig.layout and fig.layout.xaxis.range:
+        lon_min, lon_max = fig.layout.xaxis.range
+        lat_min, lat_max = fig.layout.yaxis.range
 
-    # wrap longitudes from -180..180 to 0..360
-    lon_min = (lon_min + 360) % 360
-    lon_max = (lon_max + 360) % 360
+        # wrap –180…180 → 0…360
+        lon_min = (lon_min + 360) % 360
+        lon_max = (lon_max + 360) % 360
 
-    # slice DataArray to current viewport
-    sub = da.sel(
-        longitude=slice(lon_min, lon_max),
-        latitude=slice(lat_min, lat_max)
-    )
+        sub = da.sel(
+            longitude=slice(lon_min, lon_max),
+            latitude=slice(lat_min, lat_max)
+        )
 
-    if show_anom:
-        vmax = float(np.nanmax(np.abs(sub)))
-        vmin = -vmax
-    else:
-        vmax = float(np.nanmax(sub))
-        vmin = float(np.nanmin(sub))
+        if show_anom:
+            vmax = float(np.nanmax(np.abs(sub)))
+            vmin = -vmax
+        else:
+            vmax = float(np.nanmax(sub))
+            vmin = float(np.nanmin(sub))
 
-    # update colour axis and re-draw
-    fig.update_coloraxes(cmin=vmin, cmax=vmax)
-    st.plotly_chart(fig, use_container_width=True)
+        fig.update_coloraxes(cmin=vmin, cmax=vmax)
+
+st.plotly_chart(fig, use_container_width=True)
 
 
 
