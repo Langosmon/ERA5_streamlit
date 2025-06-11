@@ -1,19 +1,46 @@
-# app.py  – ERA5 monthly means + anomalies (sidebar colour-bar sliders)
-import xarray as xr, streamlit as st, plotly.express as px
-import plotly.graph_objects as go, numpy as np, cartopy.feature as cfeature
+# app.py  – ERA5 interactive maps with colour-bar sliders
+import xarray as xr
+import streamlit as st
+import plotly.express as px
+import plotly.graph_objects as go
+import numpy as np
+import cartopy.feature as cfeature
 from pathlib import Path
 
 st.set_page_config(layout="wide")
 
-# ───────────── settings ───────────────────────────────────────────────────
+# ─────────── constants ────────────────────────────────────────────────────
 YEARS          = list(range(1980, 2023))
 COMMON_PLEVELS = [975, 850, 700, 500, 250, 100, 50, 10]
 CLIM_DIR       = Path(__file__).with_name("climatology")
 
-# (variable dictionaries unchanged — snipped for brevity)
-# … SURFACE = { ... }   PRESSURE = { ... }
+# (domain, code, vname, units, cmap_abs, cmap_anom)
+SURFACE = {
+    "Sea-surface temperature": ("sfc","034","sstk","°C",   "thermal","RdBu_r"),
+    "CAPE"                   : ("sfc","059","cape","J kg⁻¹","viridis","PuOr"),
+    "Surface geopotential"   : ("sfc","129","z","m² s⁻²",  "magma","RdBu_r"),
+    "Surface pressure"       : ("sfc","134","sp","hPa",    "icefire","RdBu_r"),
+    "Mean sea-level press."  : ("sfc","151","msl","hPa",   "icefire","RdBu_r"),
+    "10-m zonal wind"        : ("sfc","165","10u","m s⁻¹", "curl","RdBu_r"),
+    "10-m meridional wind"   : ("sfc","166","10v","m s⁻¹", "curl_r","RdBu_r"),
+    "2-m temperature"        : ("sfc","167","2t","°C",     "thermal","RdBu_r"),
+}
 
-# ───────────── sidebar controls ───────────────────────────────────────────
+PRESSURE = {
+    "Potential vorticity"  : ("pl","060","pv","PVU",      "plasma","RdBu_r"),
+    "Geopotential"         : ("pl","129","z","m² s⁻²",    "magma","RdBu_r"),
+    "Temperature"          : ("pl","130","t","K",         "thermal","RdBu_r"),
+    "Zonal wind"           : ("pl","131","u","m s⁻¹",     "curl","RdBu_r"),
+    "Meridional wind"      : ("pl","132","v","m s⁻¹",     "curl_r","RdBu_r"),
+    "Specific humidity"    : ("pl","133","q","kg kg⁻¹",   "viridis","BrBG"),
+    "Vertical velocity"    : ("pl","135","w","Pa s⁻¹",    "icefire","RdBu"),
+    "Relative vorticity"   : ("pl","138","vo","s⁻¹",      "plasma","RdBu_r"),
+    "Divergence"           : ("pl","155","d","s⁻¹",       "plasma","RdBu_r"),
+    "Relative humidity"    : ("pl","157","r","%",         "viridis","BrBG"),
+    "Ozone"                : ("pl","203","o3","kg kg⁻¹",  "viridis","RdBu_r"),
+}
+
+# ─────────── sidebar ─────────────────────────────────────────────────────
 st.sidebar.header("Field")
 field_type = st.sidebar.radio("Domain", ("Surface", "Pressure level"))
 
@@ -35,7 +62,7 @@ mon = st.sidebar.selectbox(
 show_anom  = st.sidebar.checkbox("Show anomaly (selected – climatology)")
 show_coast = st.sidebar.checkbox("Show coastlines", value=True)
 
-# ───────────── helpers ────────────────────────────────────────────────────
+# ─────────── helpers ────────────────────────────────────────────────────
 def rda_url(y, dom, code, var):
     base = "https://thredds.rda.ucar.edu/thredds/dodsC/files/g/d633001_nc/"
     if dom == "sfc":
@@ -65,22 +92,22 @@ def load_clim(dom, var, lvl):
 @st.cache_resource
 def coastlines_trace(res="110m", gap=10):
     xs, ys = [], []
-    feat = cfeature.NaturalEarthFeature("physical", "coastline", res,
+    feat = cfeature.NaturalEarthFeature("physical","coastline", res,
                                         edgecolor="black", facecolor="none")
     for geom in feat.geometries():
-        for line in getattr(geom, "geoms", [geom]):
+        for line in getattr(geom,"geoms",[geom]):
             lon, lat = line.coords.xy
-            lon = np.mod(lon, 360)
+            lon = np.mod(lon,360)
             xs.append(np.nan); ys.append(np.nan)
             for i in range(len(lon)):
                 xs.append(lon[i]); ys.append(lat[i])
-                if i < len(lon)-1 and abs(lon[i+1]-lon[i]) > gap:
+                if i<len(lon)-1 and abs(lon[i+1]-lon[i])>gap:
                     xs.append(np.nan); ys.append(np.nan)
-    return go.Scatter(x=xs, y=ys, mode="lines",
-                      line=dict(color="black", width=0.8),
-                      hoverinfo="skip", showlegend=False)
+    return go.Scatter(x=xs,y=ys,mode="lines",
+                      line=dict(color="black",width=0.8),
+                      hoverinfo="skip",showlegend=False)
 
-# ───────────── load monthly field ─────────────────────────────────────────
+# ─────────── load monthly field ─────────────────────────────────────────
 ds = open_year(rda_url(yr, domain, code, vname))
 da = ds[find_var(ds, vname)].isel(time=mon-1)
 if plevel is not None:
@@ -91,34 +118,34 @@ if vname in {"sstk","2t","t"}:   da, units = da - 273.15, "°C"
 if vname in {"sp","msl"}:        da, units = da / 100.0, "hPa"
 
 # anomaly
-cmap   = cmap_abs
+cmap = cmap_abs
 if show_anom:
     clim = load_clim(domain, vname, plevel)
     da   = da - clim.sel(month=mon)
     cmap = cmap_anom
     units += " anomaly"
 
-# ───────────── colour-bar sliders ─────────────────────────────────────────
+# ─────────── colour-bar sliders ─────────────────────────────────────────
 data_min = float(np.nanmin(da))
 data_max = float(np.nanmax(da))
 
 if show_anom:
-    # symmetric default for anomalies
     default_max = float(np.nanmax(np.abs(da)))
     default_min = -default_max
 else:
     default_min, default_max = data_min, data_max
 
 st.sidebar.markdown("### Colour-bar limits")
-cmin = st.sidebar.slider("Min", data_min, data_max, value=default_min, step=(data_max - data_min)/200)
-cmax = st.sidebar.slider("Max", data_min, data_max, value=default_max, step=(data_max - data_min)/200)
+cmin = st.sidebar.slider("Min", data_min, data_max, value=default_min,
+                         step=(data_max - data_min)/200)
+cmax = st.sidebar.slider("Max", data_min, data_max, value=default_max,
+                         step=(data_max - data_min)/200)
 
-# ensure min < max
 if cmin >= cmax:
     st.sidebar.error("Min must be less than Max")
     st.stop()
 
-# ───────────── plot ──────────────────────────────────────────────────────
+# ─────────── plot ──────────────────────────────────────────────────────
 title = f"{choice} • {mon:02d}/{yr}" + (f" • {plevel} hPa" if plevel else "")
 if show_anom: title += " • anomaly"
 
@@ -129,9 +156,8 @@ fig = px.imshow(
     labels=dict(color=units),
     title=title
 )
-
 fig.update_coloraxes(cmin=cmin, cmax=cmax)
-fig.update_layout(margin=dict(l=0, r=0, t=40, b=0), uirevision="keep")
+fig.update_layout(margin=dict(l=0,r=0,t=40,b=0), uirevision="keep")
 
 if show_coast:
     fig.add_trace(coastlines_trace())
