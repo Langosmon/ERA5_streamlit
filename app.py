@@ -8,7 +8,7 @@ st.set_page_config(layout="wide")
 
 # ───────────────────────────────────────────────────────────────────────────────
 YEARS          = list(range(1980, 2023))
-COMMON_PLEVELS = [1000, 975, 850, 700, 500, 300, 250, 200, 100, 50, 10]
+COMMON_PLEVELS = [975, 850, 700, 500, 250, 100, 50, 10]
 CLIM_DIR       = Path(__file__).with_name("climatology")
 
 # ── variable catalogues  (domain, code, vname, units, cmap_abs, cmap_anom) ────
