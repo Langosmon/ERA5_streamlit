@@ -125,21 +125,42 @@ if show_anom:
     cmap = cmap_anom
     units += " anomaly"
 
-# ─────────── colour-bar sliders ─────────────────────────────────────────
+# ─────────── colour-bar controls ──────────────────────────────────────────
 data_min = float(np.nanmin(da))
 data_max = float(np.nanmax(da))
 
 if show_anom:
+    # symmetric default for anomalies
     default_max = float(np.nanmax(np.abs(da)))
     default_min = -default_max
 else:
     default_min, default_max = data_min, data_max
 
+# Scientific-notation helper for µ-scale variables
+def sci(v):
+    if abs(v) < 1e-3:
+        return f"{v*1e6:,.0f} µ"
+    if abs(v) < 1:
+        return f"{v*1e3:,.0f} m"
+    return f"{v:,.2f}"
+
 st.sidebar.markdown("### Colour-bar limits")
-cmin = st.sidebar.slider("Min", data_min, data_max, value=default_min,
-                         step=(data_max - data_min)/200)
-cmax = st.sidebar.slider("Max", data_min, data_max, value=default_max,
-                         step=(data_max - data_min)/200)
+
+step = (default_max - default_min) / 50 or 1e-6   # avoid step=0
+
+cmin = st.sidebar.slider(
+    "Min", data_min, data_max, value=default_min,
+    step=step, format="%.4g"
+)
+cmax = st.sidebar.slider(
+    "Max", data_min, data_max, value=default_max,
+    step=step, format="%.4g"
+)
+
+# Auto-scale button (98 % central quantile)
+if st.sidebar.button("Auto-scale (98 % of data)"):
+    qmin, qmax = np.nanquantile(da, [0.01, 0.99])
+    cmin, cmax = float(qmin), float(qmax)
 
 if cmin >= cmax:
     st.sidebar.error("Min must be less than Max")
