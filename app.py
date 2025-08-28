@@ -184,7 +184,7 @@ if show_coast:
     fig.add_trace(coastlines_trace())
 
 st.plotly_chart(fig, use_container_width=True)
-
+st.caption("Plot created reading ERA5 from NCAR's RDA. Code by [Jose A. Ocegueda Sanchez](https://Langosmon.github.io).")
 
 
 
