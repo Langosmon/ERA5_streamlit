@@ -1,0 +1,14 @@
+# Climatology files are hosted on GitHub Releases (tag: climatology-v1),
+# fetched lazily by the app at runtime. Do NOT re-commit them.
+climatology/
+*.nc
+
+# Streamlit local caches
+.streamlit/secrets.toml
+__pycache__/
+*.pyc
+.DS_Store
+
+# Editor / IDE
+.vscode/
+.idea/

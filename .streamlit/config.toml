@@ -1,0 +1,17 @@
+# Streamlit theme — matches langosmon.github.io
+# Terracotta accent (Jalisco sunset), warm paper / deep navy ink.
+[theme]
+base                = "light"
+primaryColor        = "#d97757"
+backgroundColor     = "#f6f4ed"
+secondaryBackgroundColor = "#eeeae0"
+textColor           = "#1a1f33"
+font                = "serif"
+
+[server]
+runOnSave           = false
+enableCORS          = false
+enableXsrfProtection = false
+
+[browser]
+gatherUsageStats    = false
