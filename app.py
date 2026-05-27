@@ -4,6 +4,7 @@ Climatology files live on a GitHub Release attached to this repo and are
 fetched lazily on first anomaly request.  See _common.CLIM_TAG.
 """
 
+import numpy as np
 import xarray as xr
 import streamlit as st
 
@@ -38,10 +39,17 @@ st.sidebar.header("Display")
 show_anom  = st.sidebar.toggle("Anomaly (value − climatology)", value=False)
 show_sig   = st.sidebar.toggle("Mark statistically significant", value=False,
                                disabled=not show_anom,
-                               help="Stipples points where |anomaly| ≥ 1.96·σ "
-                                    "(year-to-year std dev of climatology). "
+                               help="Stipples points where |anomaly| ≥ 1.96·σ. "
                                     "Requires std-dev climatology — see repo README.")
 show_coast = st.sidebar.toggle("Coastlines", value=True)
+
+# Land-sea mask
+mask_mode = st.sidebar.radio(
+    "Show data on", ("All", "Land", "Ocean"),
+    horizontal=True,
+    help="Masks the field by ERA5's land-sea mask. Land/Ocean show only "
+         "the side you pick.",
+)
 
 
 # ─── data loading ────────────────────────────────────────────────────────────
@@ -56,8 +64,6 @@ def rda_url(year: int, dom: str, code: str, var: str) -> str:
 
 
 try:
-    # Eagerly load the whole year of (lat, lon) for this (var, plevel) into
-    # memory and cache. Switching months on the same year is then instant.
     full_year = C.load_field_cached(
         rda_url(yr, domain, code, vname), vname, plevel, decode_times=False,
     )
@@ -76,15 +82,13 @@ da, units = C.apply_unit_conversions(da, vname, units)
 
 # ─── anomaly + significance ──────────────────────────────────────────────────
 cmap = cmap_abs
-anom_da = None
 clim_std = None
 
 if show_anom:
     try:
         clim = C.load_climatology(domain, vname, plevel)
         clim_month = clim.sel(month=mon)
-        anom_da = da - clim_month
-        da = anom_da
+        da = da - clim_month
         cmap = cmap_anom
         units = (units or "") + " anomaly"
 
@@ -101,29 +105,96 @@ if show_anom:
                     "GitHub Release to enable this overlay."
                 )
                 show_sig = False
-
     except FileNotFoundError as e:
         st.warning(f"Climatology unavailable for this field — showing absolute value instead.\n\n{e}")
         show_anom = False
 
 
-# ─── colour-bar + figure ─────────────────────────────────────────────────────
-cmin, cmax = C.colourbar_controls(da, show_anom)
+# ─── land / sea mask ─────────────────────────────────────────────────────────
+if mask_mode != "All":
+    try:
+        da = C.apply_lsm_mask(da, mask_mode)
+        if clim_std is not None:
+            clim_std = C.apply_lsm_mask(clim_std, mask_mode)
+    except Exception as e:
+        st.warning(f"Couldn't load land-sea mask — showing unmasked field.\n\n{e}")
 
+
+# ─── region picker + box-select autoscale ────────────────────────────────────
+region_bbox, region_name = C.region_picker()
+
+# Decide colour-bar defaults: precedence is BOX-SELECT > REGION PRESET > DEFAULT.
+override_default = None
+override_label = None
+
+# Persist the last applied box across reruns so colour-bar stays tuned.
+last_box = st.session_state.get("_last_box")
+
+if last_box is not None:
+    lat_min, lat_max, lon_min, lon_max = last_box
+    # Convert lon if ERA5 stores 0..360 (which it does for these files)
+    if da.longitude.max() > 180 and lon_min < 0:
+        lon_min, lon_max = (lon_min + 360) % 360, (lon_max + 360) % 360
+    qlo, qhi = C.rescale_to_region(da, lat_min, lat_max, lon_min, lon_max,
+                                   symmetric=show_anom)
+    override_default = (qlo, qhi)
+    override_label = (f"Tuned to box: {lat_min:.1f}–{lat_max:.1f}°N, "
+                      f"{lon_min:.1f}–{lon_max:.1f}°E")
+elif region_bbox is not None:
+    lat_min, lat_max, lon_min, lon_max = region_bbox
+    if da.longitude.max() > 180:
+        lon_min, lon_max = (lon_min + 360) % 360, (lon_max + 360) % 360
+    qlo, qhi = C.rescale_to_region(da, lat_min, lat_max, lon_min, lon_max,
+                                   symmetric=show_anom)
+    override_default = (qlo, qhi)
+    override_label = f"Tuned to 98% of data in: {region_name}"
+
+cmin, cmax = C.colourbar_controls(da, show_anom,
+                                  override_default=override_default,
+                                  override_label=override_label)
+
+
+# ─── figure ──────────────────────────────────────────────────────────────────
 title = f"{choice} · {mon:02d}/{yr}"
 if plevel is not None: title += f" · {plevel} hPa"
 if show_anom: title += " · anomaly"
+if mask_mode != "All": title += f" · {mask_mode.lower()} only"
 
 fig = C.build_figure(da, title, units, cmap, cmin, cmax, show_coast, height=580)
 
 if show_anom and show_sig and clim_std is not None:
     C.add_significance_stipple(fig, da, clim_std, z=1.96, stride=8)
 
-st.plotly_chart(fig, use_container_width=True,
-                config={"displaylogo": False,
-                        "modeBarButtonsToRemove": ["lasso2d", "select2d"]})
+# Wire box-select on the plot for "rescale colour-bar to this region".
+event = st.plotly_chart(
+    fig, use_container_width=True,
+    on_select="rerun", selection_mode=("box",),
+    key="main_plot",
+    config={"displaylogo": False,
+            "modeBarButtonsToRemove": ["lasso2d"]},
+)
 
-# Quick-pick example dates relevant to tropical dynamics
+# Did the user just box-select? Update session state and rerun once.
+new_box = C.box_selection_to_bounds(event)
+if new_box is not None and new_box != last_box:
+    st.session_state["_last_box"] = new_box
+    st.rerun()
+
+# Tip + reset
+col_t, col_r = st.columns([4, 1])
+with col_t:
+    st.caption(
+        "💡 **Box-select tool** in the Plotly toolbar (dashed-rectangle "
+        "icon, top-right of the plot) → draw a region → colour-bar "
+        "rescales to the 98% quantile of that box. Useful for ITCZ-style "
+        "work when topography dominates the global range."
+    )
+with col_r:
+    if last_box is not None and st.button("Reset region", use_container_width=True):
+        st.session_state["_last_box"] = None
+        st.rerun()
+
+
 with st.expander("Quick picks — notable months", expanded=False):
     st.caption("Common cases worth looking at:")
     st.markdown(

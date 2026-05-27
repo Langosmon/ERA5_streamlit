@@ -179,6 +179,86 @@ def load_field_cached(url: str, vname: str, plevel: Optional[int],
     return da.load()
 
 
+# ─────────── ERA5 LAND-SEA MASK ──────────────────────────────────────────────
+# Static field, ~16 MB, fetched once from RDA invariants. Values: 1=land,
+# 0=sea, fractional at coasts.
+LSM_URL = ("https://thredds.rda.ucar.edu/thredds/dodsC/files/g/d633000/"
+           "e5.oper.invariant/197901/e5.oper.invariant.128_172_lsm.ll025sc."
+           "1979010100_1979010100.nc")
+
+
+@st.cache_resource(show_spinner="Fetching land-sea mask…")
+def load_lsm() -> xr.DataArray:
+    """Load ERA5 land-sea mask (0=sea, 1=land, fractional coasts).
+    On the same 0.25° grid as the data, so .where() works directly."""
+    ds = xr.open_dataset(LSM_URL)
+    da = ds[find_var(ds, "lsm")].squeeze()
+    return da.load()
+
+
+def apply_lsm_mask(da: xr.DataArray, mode: str) -> xr.DataArray:
+    """Apply a land-sea mask to a DataArray.  mode is one of:
+       "All" / "Land" / "Ocean".  Returns the masked DataArray."""
+    if mode == "All":
+        return da
+    lsm = load_lsm()
+    # Make sure dims match — both should be (latitude, longitude) at 0.25°.
+    # If lat orderings differ, xarray's .where() with broadcasted comparison
+    # would fail; reindex defensively.
+    try:
+        lsm_aligned = lsm.reindex_like(da, method="nearest", tolerance=0.01)
+    except Exception:
+        lsm_aligned = lsm  # fall through; .where() will broadcast best-effort
+    if mode == "Land":
+        return da.where(lsm_aligned >= 0.5)
+    if mode == "Ocean":
+        return da.where(lsm_aligned < 0.5)
+    return da
+
+
+# ─────────── REGION-AWARE COLORBAR AUTOSCALE ─────────────────────────────────
+# When the user box-selects a region, recompute colorbar from the 98% quantile
+# of data INSIDE that box. Solves the "Andes/Himalayas spikes dominate the
+# scale, ITCZ looks washed out" problem.
+def rescale_to_region(da: xr.DataArray,
+                      lat_min: float, lat_max: float,
+                      lon_min: float, lon_max: float,
+                      quantile_lo: float = 0.01,
+                      quantile_hi: float = 0.99,
+                      symmetric: bool = False) -> tuple[float, float]:
+    """Return (cmin, cmax) covering quantile_lo..quantile_hi of the data
+    inside the lat/lon box. Symmetric=True returns ±max(|q01|,|q99|), useful
+    for anomalies. Falls back to global quantiles if the box is empty."""
+    sub = da.where(
+        (da.latitude >= lat_min) & (da.latitude <= lat_max) &
+        (da.longitude >= lon_min) & (da.longitude <= lon_max)
+    )
+    vals = sub.values
+    if np.all(np.isnan(vals)):
+        vals = da.values
+    qlo, qhi = np.nanquantile(vals, [quantile_lo, quantile_hi])
+    if symmetric:
+        m = max(abs(float(qlo)), abs(float(qhi)))
+        return -m, m
+    return float(qlo), float(qhi)
+
+
+# Quick-pick region presets — common atmospheric/ocean basins.
+# Stored as (lat_min, lat_max, lon_min, lon_max) in -180..180 longitude.
+# (When ERA5 uses 0..360, longitudes here are converted at use-time.)
+REGION_PRESETS: dict[str, tuple[float, float, float, float]] = {
+    "Global":         (-90, 90, -180, 180),
+    "Tropics":        (-30, 30, -180, 180),
+    "ITCZ band":      (-15, 15, -180, 180),
+    "E Pacific (ENP)": (5, 30, -130, -85),
+    "Atlantic":        (5, 35, -85, -10),
+    "W Pacific":      (5, 35, 110, 180),
+    "Indian Ocean":  (-30, 30, 40, 105),
+    "N America":     (15, 70, -170, -50),
+    "Europe":         (35, 72, -15, 50),
+}
+
+
 # ─────────── coastlines (no cartopy) ─────────────────────────────────────────
 @st.cache_resource
 def coastlines_trace() -> go.Scatter:
@@ -206,30 +286,86 @@ def apply_unit_conversions(da: xr.DataArray, vname: str, units: str) -> tuple[xr
 
 
 # ─────────── colour-bar controls ─────────────────────────────────────────────
-def colourbar_controls(da: xr.DataArray, show_anom: bool):
+def colourbar_controls(da: xr.DataArray, show_anom: bool,
+                      override_default: Optional[tuple[float, float]] = None,
+                      override_label: Optional[str] = None):
+    """Sidebar sliders + auto-scale button for the colour-bar.
+
+    `override_default`: if provided, these (cmin, cmax) become the slider
+    defaults — used by the region-preset picker and the box-select rescale.
+    The slider RANGE still spans the full data so the user can pan beyond
+    the preset.
+    `override_label`: optional small caption shown under the controls."""
     data_min = float(np.nanmin(da))
     data_max = float(np.nanmax(da))
-    if show_anom:
+
+    if override_default is not None:
+        default_min, default_max = override_default
+    elif show_anom:
         m = float(np.nanmax(np.abs(da)))
         default_min, default_max = -m, m
     else:
         default_min, default_max = data_min, data_max
-    step = (default_max - default_min) / 50 or 1e-6
+
+    # Slider widget range covers the entire data PLUS the override so the
+    # default is always inside the slider range.
+    slider_min = min(data_min, default_min)
+    slider_max = max(data_max, default_max)
+    step = (slider_max - slider_min) / 50 or 1e-6
 
     with st.sidebar.expander("Colour-bar limits", expanded=False):
-        cmin = st.slider("Min", data_min, data_max, value=default_min,
+        if override_label:
+            st.caption(override_label)
+        cmin = st.slider("Min", slider_min, slider_max, value=default_min,
                          step=step, format="%.4g", key="cmin")
-        cmax = st.slider("Max", data_min, data_max, value=default_max,
+        cmax = st.slider("Max", slider_min, slider_max, value=default_max,
                          step=step, format="%.4g", key="cmax")
         if st.button("Auto-scale (98 % of data)", use_container_width=True):
             qmin, qmax = np.nanquantile(da, [0.01, 0.99])
-            cmin, cmax = float(qmin), float(qmax)
+            st.session_state["cmin"] = float(qmin)
+            st.session_state["cmax"] = float(qmax)
             st.rerun()
 
     if cmin >= cmax:
         st.sidebar.error("Min must be less than Max")
         st.stop()
     return cmin, cmax
+
+
+# ─────────── region picker (sidebar) ─────────────────────────────────────────
+def region_picker():
+    """Render the region preset selector. Returns the chosen region tuple
+    (lat_min, lat_max, lon_min, lon_max) or None for Global / no rescale."""
+    st.sidebar.header("Region focus")
+    name = st.sidebar.selectbox(
+        "Rescale colour-bar to region",
+        list(REGION_PRESETS.keys()),
+        index=0,
+        help="Tunes the colour-bar to the 98% quantile of data inside the "
+             "chosen region. The map still shows the whole field — values "
+             "outside this range are clipped to the bar ends. "
+             "Hint: use Plotly's box-select tool to define a custom region.",
+        key="region_name",
+    )
+    if name == "Global":
+        return None, name
+    return REGION_PRESETS[name], name
+
+
+def box_selection_to_bounds(event: Optional[dict]) -> Optional[tuple[float, float, float, float]]:
+    """Extract (lat_min, lat_max, lon_min, lon_max) from a Streamlit
+    plotly_chart on_select event. Returns None if no box."""
+    if not event or "selection" not in event:
+        return None
+    boxes = event.get("selection", {}).get("box") or []
+    if not boxes:
+        return None
+    b = boxes[0]
+    xs = b.get("x") or []
+    ys = b.get("y") or []
+    if len(xs) < 2 or len(ys) < 2:
+        return None
+    return (float(min(ys)), float(max(ys)), float(min(xs)), float(max(xs)))
 
 
 # ─────────── statistical significance ────────────────────────────────────────
