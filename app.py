@@ -56,10 +56,12 @@ def rda_url(year: int, dom: str, code: str, var: str) -> str:
 
 
 try:
-    ds = C.open_dataset_cached(rda_url(yr, domain, code, vname), decode_times=False)
-    da = ds[C.find_var(ds, vname)].isel(time=mon - 1)
-    if plevel is not None:
-        da = da.sel(level=plevel)
+    # Eagerly load the whole year of (lat, lon) for this (var, plevel) into
+    # memory and cache. Switching months on the same year is then instant.
+    full_year = C.load_field_cached(
+        rda_url(yr, domain, code, vname), vname, plevel, decode_times=False,
+    )
+    da = full_year.isel(time=mon - 1)
 except Exception as e:
     st.error(
         "**Failed to load remote ERA5 data.**  "

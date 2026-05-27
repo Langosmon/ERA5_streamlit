@@ -88,10 +88,9 @@ def _clim_local_path(domain: str, var: str, lvl: Optional[int]) -> Path:
 @st.cache_resource(show_spinner="Fetching climatology…")
 def load_climatology(domain: str, var: str, lvl: Optional[int]):
     """Lazily fetch a climatology file from GitHub Releases on first use,
-    cache to /tmp, then memoize the opened xarray DataArray for the session.
-
-    Returns the DataArray of the variable, or raises a friendly Streamlit
-    error if the file is not available."""
+    cache to /tmp, then memoize the loaded DataArray (in memory) for the
+    rest of the session. Returns a DataArray with `.load()` already called
+    so all subsequent slicing is in-memory and instant."""
     local = _clim_local_path(domain, var, lvl)
 
     if not local.exists():
@@ -104,14 +103,15 @@ def load_climatology(domain: str, var: str, lvl: Optional[int]):
                     f"URL: {url}\nStatus: {r.status_code}"
                 )
             with open(local, "wb") as f:
-                for chunk in r.iter_content(8192):
+                for chunk in r.iter_content(1 << 16):
                     f.write(chunk)
         except requests.exceptions.RequestException as e:
             raise FileNotFoundError(f"Could not reach climatology host: {e}") from e
 
     ds = xr.open_dataset(local)
     da = ds[find_var(ds, var)]
-    return da
+    # Load eagerly so .sel(month=...) below is a free in-memory operation.
+    return da.load()
 
 
 def climatology_has_std(domain: str, var: str, lvl: Optional[int]) -> bool:
@@ -155,6 +155,28 @@ def find_var(ds: xr.Dataset, short: str) -> str:
 @st.cache_resource(show_spinner="Opening remote dataset…")
 def open_dataset_cached(url: str, decode_times: bool = True) -> xr.Dataset:
     return xr.open_dataset(url, decode_times=decode_times)
+
+
+@st.cache_data(show_spinner="Loading from RDA…", max_entries=24, ttl=3600)
+def load_field_cached(url: str, vname: str, plevel: Optional[int],
+                      decode_times: bool = True) -> xr.DataArray:
+    """Open a remote dataset, slice the requested variable (and pressure
+    level), and EAGERLY LOAD the data into memory.  Cached by Streamlit so
+    subsequent calls with the same args return instantly (no RDA round-trip).
+
+    This is the biggest perceived-speed win: changing the *month* (monthly
+    app) or *hour* (hourly app) on the same (year, var, plevel) becomes
+    in-memory slicing instead of a fresh OPeNDAP request.
+
+    max_entries=24 caps memory at roughly 24 × 50 MB ≈ 1.2 GB which is
+    Streamlit Cloud's free-tier ceiling.  TTL=1h trims stale entries."""
+    ds = xr.open_dataset(url, decode_times=decode_times)
+    da = ds[find_var(ds, vname)]
+    if plevel is not None:
+        # Server-side slice — OPeNDAP only transfers the one level.
+        da = da.sel(level=plevel)
+    # Force the actual download now; subsequent operations are in-memory.
+    return da.load()
 
 
 # ─────────── coastlines (no cartopy) ─────────────────────────────────────────
