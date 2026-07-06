@@ -7,16 +7,22 @@ Provides:
   - SURFACE, PRESSURE, COMMON_PLEVELS variable catalogues
   - coastlines_trace(): fast, no-cartopy coastline overlay
   - find_var(): tolerant ERA5 variable name lookup
-  - open_dataset_cached(): cached remote xarray dataset opener
-  - load_climatology(): fetches climatology .nc from GitHub Releases on demand
-  - apply_unit_conversions(): K→°C, Pa→hPa
+  - load_field_cached(): cached remote field loader (slices time/level
+    server-side BEFORE downloading)
+  - load_climatology() / load_climatology_std(): climatology from GitHub
+    Releases, one download + one open per (domain, var, lvl)
+  - apply_unit_conversions(): K→°C, Pa→hPa, PV→PVU (anomaly-aware)
   - build_figure(): site-themed Plotly figure
-  - significance_stipple(): hatch-mask for not-significant regions
+  - add_significance_stipple(): dots where |anom| ≥ z·σ
   - configure_page() / render_footer(): site-branded UI shell
+
+Unit-conversion contract: all loaders return fields in ERA5 NATIVE units
+(K, Pa, SI potential vorticity). Convert for display with
+apply_unit_conversions() AFTER any anomaly subtraction, so the field and the
+climatology are always differenced in the same units.
 """
 
 from __future__ import annotations
-import io
 import json
 from pathlib import Path
 from typing import Optional
@@ -45,18 +51,19 @@ SURFACE: dict[str, tuple] = {
 PRESSURE: dict[str, tuple] = {
     "Potential vorticity":   ("pl", "060", "pv", "PVU",     "plasma",  "RdBu_r"),
     "Geopotential":          ("pl", "129", "z",  "m² s⁻²",  "magma",   "RdBu_r"),
-    "Temperature":           ("pl", "130", "t",  "K",       "thermal", "RdBu_r"),
+    "Temperature":           ("pl", "130", "t",  "°C",      "thermal", "RdBu_r"),
     "Zonal wind":            ("pl", "131", "u",  "m s⁻¹",   "curl",    "RdBu_r"),
     "Meridional wind":       ("pl", "132", "v",  "m s⁻¹",   "curl_r",  "RdBu_r"),
     "Specific humidity":     ("pl", "133", "q",  "kg kg⁻¹", "viridis", "BrBG"),
-    "Vertical velocity":     ("pl", "135", "w",  "Pa s⁻¹",  "icefire", "RdBu"),
+    # ω is pressure-coordinate vertical velocity: positive = DESCENT.
+    "Vertical velocity (ω)": ("pl", "135", "w",  "Pa s⁻¹ · + = descent", "icefire", "RdBu"),
     "Relative vorticity":    ("pl", "138", "vo", "s⁻¹",     "plasma",  "RdBu_r"),
     "Divergence":            ("pl", "155", "d",  "s⁻¹",     "plasma",  "RdBu_r"),
     "Relative humidity":     ("pl", "157", "r",  "%",       "viridis", "BrBG"),
     "Ozone":                 ("pl", "203", "o3", "kg kg⁻¹", "viridis", "RdBu_r"),
 }
 
-COMMON_PLEVELS: list[int] = [975, 850, 700, 500, 250, 100, 50, 10]
+COMMON_PLEVELS: list[int] = [1000, 925, 850, 700, 500, 300, 250, 100, 50, 10]
 
 
 # ─────────── REMOTE CLIMATOLOGY ──────────────────────────────────────────────
@@ -65,6 +72,7 @@ COMMON_PLEVELS: list[int] = [975, 850, 700, 500, 250, 100, 50, 10]
 # 96 files. URLs are of the form:
 #     {CLIM_BASE}/{tag}/{sfc|pl}__{var}[_<lvl>].nc
 # (double-underscore separator because GitHub Releases flatten paths).
+# Files store ERA5 NATIVE units — see the module docstring.
 CLIM_BASE = "https://github.com/Langosmon/ERA5_streamlit/releases/download"
 CLIM_TAG  = "climatology-v1"   # bump if you reupload regenerated files
 
@@ -86,11 +94,10 @@ def _clim_local_path(domain: str, var: str, lvl: Optional[int]) -> Path:
 
 
 @st.cache_resource(show_spinner="Fetching climatology…")
-def load_climatology(domain: str, var: str, lvl: Optional[int]):
-    """Lazily fetch a climatology file from GitHub Releases on first use,
-    cache to /tmp, then memoize the loaded DataArray (in memory) for the
-    rest of the session. Returns a DataArray with `.load()` already called
-    so all subsequent slicing is in-memory and instant."""
+def _clim_dataset(domain: str, var: str, lvl: Optional[int]) -> xr.Dataset:
+    """Download (once) and open (once) a climatology file, fully loaded into
+    memory. Every helper below reads from this single cached Dataset, so
+    reruns never re-open the netCDF."""
     local = _clim_local_path(domain, var, lvl)
 
     if not local.exists():
@@ -108,37 +115,40 @@ def load_climatology(domain: str, var: str, lvl: Optional[int]):
         except requests.exceptions.RequestException as e:
             raise FileNotFoundError(f"Could not reach climatology host: {e}") from e
 
-    ds = xr.open_dataset(local)
-    da = ds[find_var(ds, var)]
-    # Load eagerly so .sel(month=...) below is a free in-memory operation.
-    return da.load()
+    with xr.open_dataset(local) as ds:
+        return ds.load()
+
+
+def load_climatology(domain: str, var: str, lvl: Optional[int]) -> xr.DataArray:
+    """Climatology mean in NATIVE units, already in memory — slicing by
+    month is free."""
+    ds = _clim_dataset(domain, var, lvl)
+    return ds[find_var(ds, var)]
+
+
+def _find_std_name(ds: xr.Dataset) -> Optional[str]:
+    for k in ds.variables:
+        if "std" in k.lower() or "stddev" in k.lower() or "sigma" in k.lower():
+            return k
+    return None
 
 
 def climatology_has_std(domain: str, var: str, lvl: Optional[int]) -> bool:
-    """Check if the climatology file includes an 'std' variable (needed for
-    statistical-significance tests). Returns False if file missing OR std
-    variable not present."""
+    """True if the climatology file includes a std-dev variable (needed for
+    statistical-significance tests)."""
     try:
-        local = _clim_local_path(domain, var, lvl)
-        if not local.exists():
-            return False
-        ds = xr.open_dataset(local)
-        for k in ds.variables:
-            if "std" in k.lower() or "stddev" in k.lower() or "sigma" in k.lower():
-                return True
-        return False
+        return _find_std_name(_clim_dataset(domain, var, lvl)) is not None
     except Exception:
         return False
 
 
-def load_climatology_std(domain: str, var: str, lvl: Optional[int]):
-    """Return the std-dev DataArray from the climatology file, if present."""
-    local = _clim_local_path(domain, var, lvl)
-    ds = xr.open_dataset(local)
-    for k in ds.variables:
-        if "std" in k.lower() or "stddev" in k.lower() or "sigma" in k.lower():
-            return ds[k]
-    raise KeyError("std variable not found in climatology file")
+def load_climatology_std(domain: str, var: str, lvl: Optional[int]) -> xr.DataArray:
+    """The std-dev DataArray from the climatology file (NATIVE units)."""
+    ds = _clim_dataset(domain, var, lvl)
+    name = _find_std_name(ds)
+    if name is None:
+        raise KeyError("std variable not found in climatology file")
+    return ds[name]
 
 
 # ─────────── data access ─────────────────────────────────────────────────────
@@ -152,36 +162,37 @@ def find_var(ds: xr.Dataset, short: str) -> str:
     raise KeyError(short)
 
 
-@st.cache_resource(show_spinner="Opening remote dataset…")
-def open_dataset_cached(url: str, decode_times: bool = True) -> xr.Dataset:
-    return xr.open_dataset(url, decode_times=decode_times)
-
-
-@st.cache_data(show_spinner="Loading from RDA…", max_entries=24, ttl=3600)
+@st.cache_resource(show_spinner="Loading from RDA…", max_entries=6)
 def load_field_cached(url: str, vname: str, plevel: Optional[int],
-                      decode_times: bool = True) -> xr.DataArray:
-    """Open a remote dataset, slice the requested variable (and pressure
-    level), and EAGERLY LOAD the data into memory.  Cached by Streamlit so
-    subsequent calls with the same args return instantly (no RDA round-trip).
+                      decode_times: bool = True,
+                      time_sel: Optional[str] = None) -> xr.DataArray:
+    """Open a remote dataset, slice the requested variable — and, crucially,
+    the pressure level and/or time — BEFORE downloading, then eagerly load.
 
-    This is the biggest perceived-speed win: changing the *month* (monthly
-    app) or *hour* (hourly app) on the same (year, var, plevel) becomes
-    in-memory slicing instead of a fresh OPeNDAP request.
+    OPeNDAP translates the .sel() calls into server-side subsetting, so only
+    the requested slab crosses the network:
+      - monthly app: one year of one variable (~50 MB) → month scrubbing on
+        the same year is instant in-memory slicing.
+      - hourly app: pass `time_sel` (ISO string) to fetch a single hour
+        (~4 MB) instead of a whole month of hourly data (~3 GB).
 
-    max_entries=24 caps memory at roughly 24 × 50 MB ≈ 1.2 GB which is
-    Streamlit Cloud's free-tier ceiling.  TTL=1h trims stale entries."""
+    Cached with st.cache_resource: the array is shared across reruns and
+    sessions with NO per-rerun pickle/unpickle copy (all downstream ops
+    produce new arrays, nothing mutates in place). max_entries=6 bounds
+    worst-case memory at ~6 × 50 MB. No TTL — reanalysis is immutable.
+    """
     ds = xr.open_dataset(url, decode_times=decode_times)
     da = ds[find_var(ds, vname)]
     if plevel is not None:
-        # Server-side slice — OPeNDAP only transfers the one level.
         da = da.sel(level=plevel)
-    # Force the actual download now; subsequent operations are in-memory.
-    return da.load()
+    if time_sel is not None:
+        da = da.sel(time=time_sel, method="nearest")
+    return da.load().astype(np.float32)
 
 
 # ─────────── ERA5 LAND-SEA MASK ──────────────────────────────────────────────
-# Static field, ~16 MB, fetched once from RDA invariants. Values: 1=land,
-# 0=sea, fractional at coasts.
+# Static field, fetched once from RDA invariants. Values: 1=land, 0=sea,
+# fractional at coasts (≥0.5 is ECMWF's standard land definition).
 LSM_URL = ("https://thredds.rda.ucar.edu/thredds/dodsC/files/g/d633000/"
            "e5.oper.invariant/197901/e5.oper.invariant.128_172_lsm.ll025sc."
            "1979010100_1979010100.nc")
@@ -196,19 +207,27 @@ def load_lsm() -> xr.DataArray:
     return da.load()
 
 
+# Memo of the mask re-aligned to each distinct data grid (keyed by the grid's
+# fingerprint) so reruns don't repeat the reindex.
+_LSM_ALIGNED: dict[tuple, xr.DataArray] = {}
+
+
 def apply_lsm_mask(da: xr.DataArray, mode: str) -> xr.DataArray:
     """Apply a land-sea mask to a DataArray.  mode is one of:
        "All" / "Land" / "Ocean".  Returns the masked DataArray."""
     if mode == "All":
         return da
-    lsm = load_lsm()
-    # Make sure dims match — both should be (latitude, longitude) at 0.25°.
-    # If lat orderings differ, xarray's .where() with broadcasted comparison
-    # would fail; reindex defensively.
-    try:
-        lsm_aligned = lsm.reindex_like(da, method="nearest", tolerance=0.01)
-    except Exception:
-        lsm_aligned = lsm  # fall through; .where() will broadcast best-effort
+    lat, lon = da.latitude.values, da.longitude.values
+    key = (float(lat[0]), float(lat[-1]), lat.size,
+           float(lon[0]), float(lon[-1]), lon.size)
+    lsm_aligned = _LSM_ALIGNED.get(key)
+    if lsm_aligned is None:
+        lsm = load_lsm()
+        try:
+            lsm_aligned = lsm.reindex_like(da, method="nearest", tolerance=0.01)
+        except Exception:
+            lsm_aligned = lsm  # fall through; .where() broadcasts best-effort
+        _LSM_ALIGNED[key] = lsm_aligned
     if mode == "Land":
         return da.where(lsm_aligned >= 0.5)
     if mode == "Ocean":
@@ -217,9 +236,9 @@ def apply_lsm_mask(da: xr.DataArray, mode: str) -> xr.DataArray:
 
 
 # ─────────── REGION-AWARE COLORBAR AUTOSCALE ─────────────────────────────────
-# When the user box-selects a region, recompute colorbar from the 98% quantile
-# of data INSIDE that box. Solves the "Andes/Himalayas spikes dominate the
-# scale, ITCZ looks washed out" problem.
+# When the user box-selects a region or picks a preset, recompute the colorbar
+# from the 98% quantile of data INSIDE that box. Solves the "Andes/Himalayas
+# spikes dominate the scale, ITCZ looks washed out" problem.
 def rescale_to_region(da: xr.DataArray,
                       lat_min: float, lat_max: float,
                       lon_min: float, lon_max: float,
@@ -227,16 +246,40 @@ def rescale_to_region(da: xr.DataArray,
                       quantile_hi: float = 0.99,
                       symmetric: bool = False) -> tuple[float, float]:
     """Return (cmin, cmax) covering quantile_lo..quantile_hi of the data
-    inside the lat/lon box. Symmetric=True returns ±max(|q01|,|q99|), useful
-    for anomalies. Falls back to global quantiles if the box is empty."""
-    sub = da.where(
-        (da.latitude >= lat_min) & (da.latitude <= lat_max) &
-        (da.longitude >= lon_min) & (da.longitude <= lon_max)
-    )
-    vals = sub.values
-    if np.all(np.isnan(vals)):
-        vals = da.values
-    qlo, qhi = np.nanquantile(vals, [quantile_lo, quantile_hi])
+    inside the lat/lon box.
+
+    Longitude handling: bounds may be given in either -180..180 or 0..360;
+    they are mapped onto the data's own convention. Boxes that wrap across
+    Greenwich or the antimeridian (lon_min > lon_max after mapping) select
+    the union (lon ≥ lon_min) OR (lon ≤ lon_max). A box spanning the full
+    circle skips the longitude filter entirely.
+
+    symmetric=True returns ±max(|q_lo|,|q_hi|) — use for anomaly fields.
+    Falls back to global quantiles if the box is empty."""
+    lats = da.latitude.values
+    lons = da.longitude.values
+    vals = da.values
+
+    lat_mask = (lats >= lat_min) & (lats <= lat_max)
+
+    full_circle = (lon_max - lon_min) >= 359.5
+    if full_circle:
+        lon_mask = np.ones(lons.size, dtype=bool)
+    else:
+        if lons.max() > 180:            # data on 0..360
+            lon_min, lon_max = lon_min % 360, lon_max % 360
+        else:                            # data on -180..180
+            lon_min = ((lon_min + 180) % 360) - 180
+            lon_max = ((lon_max + 180) % 360) - 180
+        if lon_min <= lon_max:
+            lon_mask = (lons >= lon_min) & (lons <= lon_max)
+        else:                            # box wraps the seam
+            lon_mask = (lons >= lon_min) | (lons <= lon_max)
+
+    sub = vals[np.ix_(lat_mask, lon_mask)] if (lat_mask.any() and lon_mask.any()) else vals
+    if sub.size == 0 or np.all(np.isnan(sub)):
+        sub = vals
+    qlo, qhi = np.nanquantile(sub, [quantile_lo, quantile_hi])
     if symmetric:
         m = max(abs(float(qlo)), abs(float(qhi)))
         return -m, m
@@ -244,8 +287,8 @@ def rescale_to_region(da: xr.DataArray,
 
 
 # Quick-pick region presets — common atmospheric/ocean basins.
-# Stored as (lat_min, lat_max, lon_min, lon_max) in -180..180 longitude.
-# (When ERA5 uses 0..360, longitudes here are converted at use-time.)
+# Stored as (lat_min, lat_max, lon_min, lon_max) in -180..180 longitude;
+# rescale_to_region maps them onto the data's own convention.
 REGION_PRESETS: dict[str, tuple[float, float, float, float]] = {
     "Global":         (-90, 90, -180, 180),
     "Tropics":        (-30, 30, -180, 180),
@@ -267,7 +310,9 @@ def coastlines_trace() -> go.Scatter:
     return go.Scatter(
         x=data["xs"], y=data["ys"],
         mode="lines",
-        line=dict(color="rgba(20,20,20,0.65)", width=0.7),
+        # Mid-gray with alpha: readable on light AND dark themes, and doesn't
+        # out-shout a diverging colormap's neutral center.
+        line=dict(color="rgba(96,102,114,0.55)", width=0.6),
         hoverinfo="skip",
         showlegend=False,
         name="coast",
@@ -275,13 +320,24 @@ def coastlines_trace() -> go.Scatter:
 
 
 # ─────────── unit conversions ────────────────────────────────────────────────
-def apply_unit_conversions(da: xr.DataArray, vname: str, units: str) -> tuple[xr.DataArray, str]:
+def apply_unit_conversions(da: xr.DataArray, vname: str, units: str,
+                           anomaly: bool = False) -> tuple[xr.DataArray, str]:
+    """Convert a NATIVE-units field for display. Call AFTER any anomaly
+    subtraction (see module docstring).
+
+    anomaly=True skips offset-type conversions that cancel in a difference
+    (K→°C is a pure shift, so a K anomaly already IS a °C anomaly) but keeps
+    scale-type conversions (Pa→hPa, PV→PVU), which also apply to std devs."""
     if vname in {"sstk", "2t", "t"}:
-        da = da - 273.15
+        if not anomaly:
+            da = da - 273.15
         units = "°C"
     if vname in {"sp", "msl"}:
         da = da / 100.0
         units = "hPa"
+    if vname == "pv":
+        da = da * 1.0e6          # 1 PVU = 1e-6 K m² kg⁻¹ s⁻¹
+        units = "PVU"
     return da, units
 
 
@@ -296,13 +352,14 @@ def colourbar_controls(da: xr.DataArray, show_anom: bool,
     The slider RANGE still spans the full data so the user can pan beyond
     the preset.
     `override_label`: optional small caption shown under the controls."""
-    data_min = float(np.nanmin(da))
-    data_max = float(np.nanmax(da))
+    arr = da.values
+    data_min = float(np.nanmin(arr))
+    data_max = float(np.nanmax(arr))
 
     if override_default is not None:
         default_min, default_max = override_default
     elif show_anom:
-        m = float(np.nanmax(np.abs(da)))
+        m = max(abs(data_min), abs(data_max))
         default_min, default_max = -m, m
     else:
         default_min, default_max = data_min, data_max
@@ -321,7 +378,7 @@ def colourbar_controls(da: xr.DataArray, show_anom: bool,
         cmax = st.slider("Max", slider_min, slider_max, value=default_max,
                          step=step, format="%.4g", key="cmax")
         if st.button("Auto-scale (98 % of data)", use_container_width=True):
-            qmin, qmax = np.nanquantile(da, [0.01, 0.99])
+            qmin, qmax = np.nanquantile(arr, [0.01, 0.99])
             st.session_state["cmin"] = float(qmin)
             st.session_state["cmax"] = float(qmax)
             st.rerun()
@@ -352,12 +409,15 @@ def region_picker():
     return REGION_PRESETS[name], name
 
 
-def box_selection_to_bounds(event: Optional[dict]) -> Optional[tuple[float, float, float, float]]:
+def box_selection_to_bounds(event) -> Optional[tuple[float, float, float, float]]:
     """Extract (lat_min, lat_max, lon_min, lon_max) from a Streamlit
-    plotly_chart on_select event. Returns None if no box."""
-    if not event or "selection" not in event:
+    plotly_chart selection event/state. Returns None if no box."""
+    if not event:
         return None
-    boxes = event.get("selection", {}).get("box") or []
+    sel = event.get("selection") if hasattr(event, "get") else None
+    if not sel:
+        return None
+    boxes = sel.get("box") or []
     if not boxes:
         return None
     b = boxes[0]
@@ -369,29 +429,23 @@ def box_selection_to_bounds(event: Optional[dict]) -> Optional[tuple[float, floa
 
 
 # ─────────── statistical significance ────────────────────────────────────────
-def significance_mask(anom: xr.DataArray, std: xr.DataArray, z: float = 1.96) -> np.ndarray:
-    """Return a boolean array True where |anom| >= z·std (i.e. significant).
-    Default z=1.96 ≈ 95% confidence assuming year-to-year normality of the
-    climatology."""
-    return (np.abs(anom.values) >= z * np.abs(std.values))
-
-
 def add_significance_stipple(fig: go.Figure, anom: xr.DataArray,
                              std: xr.DataArray, z: float = 1.96,
                              stride: int = 8) -> None:
-    """Overlay sparse dots where the anomaly IS significant. Stride controls
-    density (every Nth grid point), so we don't bury the map in markers."""
-    sig = significance_mask(anom, std, z=z)
-    lats = anom.latitude.values
-    lons = anom.longitude.values
+    """Overlay sparse dots where |anom| ≥ z·σ (≈95% confidence assuming
+    year-to-year normality). Subsamples BEFORE comparing, so the test runs on
+    1/stride² of the grid — same visual output, ~64× less work at stride=8.
+    Pass anom and std in the SAME units (both native or both converted)."""
+    sub_a = anom.values[::stride, ::stride]
+    sub_s = std.values[::stride, ::stride]
+    sig = np.abs(sub_a) >= z * np.abs(sub_s)
     ys, xs = np.where(sig)
-    # subsample
-    keep = (ys % stride == 0) & (xs % stride == 0)
-    ys, xs = ys[keep], xs[keep]
+    lats = anom.latitude.values[::stride]
+    lons = anom.longitude.values[::stride]
     fig.add_trace(go.Scatter(
         x=lons[xs], y=lats[ys],
         mode="markers",
-        marker=dict(size=2, color="rgba(0,0,0,0.55)", symbol="circle"),
+        marker=dict(size=2, color="rgba(96,102,114,0.6)", symbol="circle"),
         hoverinfo="skip", showlegend=False, name=f"sig (|z|≥{z})",
     ))
 
@@ -434,6 +488,21 @@ def build_figure(da: xr.DataArray, title: str, units: str, cmap: str,
 # ─────────── presentation ────────────────────────────────────────────────────
 SITE_URL = "https://langosmon.github.io"
 
+_FONT_CSS = """
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Source+Serif+4:opsz,wght@8..60,400;8..60,600&family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+<style>
+  html, body, .stApp, [data-testid="stSidebar"] *, .stMarkdown, button, input, select {
+    font-family: "Inter", -apple-system, "Segoe UI", sans-serif;
+  }
+  h1, h2, h3 { font-family: "Source Serif 4", Georgia, serif; }
+  code, pre, [data-testid="stMetricValue"] {
+    font-family: "JetBrains Mono", ui-monospace, monospace;
+  }
+</style>
+"""
+
 
 def configure_page(title: str, subtitle: str | None = None,
                    icon: str = "🌀") -> None:
@@ -448,6 +517,7 @@ def configure_page(title: str, subtitle: str | None = None,
                      f"ERA5 data via NCAR's RDA. Source on GitHub.",
         },
     )
+    st.markdown(_FONT_CSS, unsafe_allow_html=True)
     st.markdown(
         f"""
         <div style='display:flex; justify-content:space-between; align-items:baseline;

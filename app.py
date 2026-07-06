@@ -2,6 +2,9 @@
 
 Climatology files live on a GitHub Release attached to this repo and are
 fetched lazily on first anomaly request.  See _common.CLIM_TAG.
+
+Unit contract: fields and climatology are differenced in ERA5 NATIVE units;
+apply_unit_conversions() runs AFTER the anomaly step (see _common docstring).
 """
 
 import numpy as np
@@ -19,7 +22,7 @@ C.configure_page(
 )
 
 REPO_URL = "https://github.com/Langosmon/ERA5_streamlit"
-YEARS = list(range(1980, 2023))
+YEARS = list(range(1980, 2023))   # d633001_nc monthly means end at 2022
 
 
 # ─── sidebar controls ────────────────────────────────────────────────────────
@@ -39,7 +42,10 @@ st.sidebar.header("Display")
 show_anom  = st.sidebar.toggle("Anomaly (value − climatology)", value=False)
 show_sig   = st.sidebar.toggle("Mark statistically significant", value=False,
                                disabled=not show_anom,
-                               help="Stipples points where |anomaly| ≥ 1.96·σ. "
+                               help="Stipples points where |anomaly| ≥ 1.96·σ, "
+                                    "with σ the 1980–2010 interannual std dev "
+                                    "of the monthly mean (approximate; assumes "
+                                    "Gaussian year-to-year variability). "
                                     "Requires std-dev climatology — see repo README.")
 show_coast = st.sidebar.toggle("Coastlines", value=True)
 
@@ -74,13 +80,12 @@ except Exception as e:
         "The RDA server may be temporarily unreachable, or this "
         "year/variable/level combination may not exist."
     )
-    st.exception(e)
+    with st.expander("Technical details"):
+        st.exception(e)
     st.stop()
 
-da, units = C.apply_unit_conversions(da, vname, units)
 
-
-# ─── anomaly + significance ──────────────────────────────────────────────────
+# ─── anomaly + significance (native units) ───────────────────────────────────
 cmap = cmap_abs
 clim_std = None
 
@@ -88,9 +93,8 @@ if show_anom:
     try:
         clim = C.load_climatology(domain, vname, plevel)
         clim_month = clim.sel(month=mon)
-        da = da - clim_month
+        da = da - clim_month          # native − native: units match
         cmap = cmap_anom
-        units = (units or "") + " anomaly"
 
         if show_sig:
             if C.climatology_has_std(domain, vname, plevel):
@@ -108,6 +112,15 @@ if show_anom:
     except FileNotFoundError as e:
         st.warning(f"Climatology unavailable for this field — showing absolute value instead.\n\n{e}")
         show_anom = False
+        cmap = cmap_abs
+
+# Convert for display AFTER the subtraction so field and climatology were
+# differenced in the same units. σ gets scale-only conversion (anomaly=True).
+da, units = C.apply_unit_conversions(da, vname, units, anomaly=show_anom)
+if show_anom:
+    units = (units or "") + " anomaly"
+if clim_std is not None:
+    clim_std, _ = C.apply_unit_conversions(clim_std, vname, units, anomaly=True)
 
 
 # ─── land / sea mask ─────────────────────────────────────────────────────────
@@ -116,25 +129,31 @@ if mask_mode != "All":
         da = C.apply_lsm_mask(da, mask_mode)
         if clim_std is not None:
             clim_std = C.apply_lsm_mask(clim_std, mask_mode)
+        if bool(np.all(np.isnan(da.values))):
+            st.info(f"**Nothing to show:** {choice} has no data over "
+                    f"{mask_mode.lower()} (e.g. SST is ocean-only). "
+                    "Switch \"Show data on\" back to All or the other side.")
     except Exception as e:
         st.warning(f"Couldn't load land-sea mask — showing unmasked field.\n\n{e}")
 
 
-# ─── region picker + box-select autoscale ────────────────────────────────────
+# ─── region focus: preset picker + box-select ────────────────────────────────
 region_bbox, region_name = C.region_picker()
 
-# Decide colour-bar defaults: precedence is BOX-SELECT > REGION PRESET > DEFAULT.
+# A box drawn on the chart arrives via the widget's session state on the
+# on_select rerun — read it BEFORE building the figure so a single rerun
+# both stores and applies it (no second st.rerun round-trip).
+state_box = C.box_selection_to_bounds(st.session_state.get("main_plot"))
+if state_box is not None and state_box != st.session_state.get("_dismissed_box"):
+    st.session_state["_last_box"] = state_box
+last_box = st.session_state.get("_last_box")
+
+# Colour-bar defaults: precedence is BOX-SELECT > REGION PRESET > DEFAULT.
 override_default = None
 override_label = None
 
-# Persist the last applied box across reruns so colour-bar stays tuned.
-last_box = st.session_state.get("_last_box")
-
 if last_box is not None:
     lat_min, lat_max, lon_min, lon_max = last_box
-    # Convert lon if ERA5 stores 0..360 (which it does for these files)
-    if da.longitude.max() > 180 and lon_min < 0:
-        lon_min, lon_max = (lon_min + 360) % 360, (lon_max + 360) % 360
     qlo, qhi = C.rescale_to_region(da, lat_min, lat_max, lon_min, lon_max,
                                    symmetric=show_anom)
     override_default = (qlo, qhi)
@@ -142,8 +161,6 @@ if last_box is not None:
                       f"{lon_min:.1f}–{lon_max:.1f}°E")
 elif region_bbox is not None:
     lat_min, lat_max, lon_min, lon_max = region_bbox
-    if da.longitude.max() > 180:
-        lon_min, lon_max = (lon_min + 360) % 360, (lon_max + 360) % 360
     qlo, qhi = C.rescale_to_region(da, lat_min, lat_max, lon_min, lon_max,
                                    symmetric=show_anom)
     override_default = (qlo, qhi)
@@ -165,20 +182,14 @@ fig = C.build_figure(da, title, units, cmap, cmin, cmax, show_coast, height=580)
 if show_anom and show_sig and clim_std is not None:
     C.add_significance_stipple(fig, da, clim_std, z=1.96, stride=8)
 
-# Wire box-select on the plot for "rescale colour-bar to this region".
-event = st.plotly_chart(
+# Box-select on the plot = "rescale colour-bar to this region".
+st.plotly_chart(
     fig, use_container_width=True,
     on_select="rerun", selection_mode=("box",),
     key="main_plot",
     config={"displaylogo": False,
             "modeBarButtonsToRemove": ["lasso2d"]},
 )
-
-# Did the user just box-select? Update session state and rerun once.
-new_box = C.box_selection_to_bounds(event)
-if new_box is not None and new_box != last_box:
-    st.session_state["_last_box"] = new_box
-    st.rerun()
 
 # Tip + reset
 col_t, col_r = st.columns([4, 1])
@@ -191,6 +202,7 @@ with col_t:
     )
 with col_r:
     if last_box is not None and st.button("Reset region", use_container_width=True):
+        st.session_state["_dismissed_box"] = last_box
         st.session_state["_last_box"] = None
         st.rerun()
 
@@ -198,10 +210,10 @@ with col_r:
 with st.expander("Quick picks — notable months", expanded=False):
     st.caption("Common cases worth looking at:")
     st.markdown(
-        "- **Oct 2023** — Hurricane Otis intensification month (try SST anomaly)\n"
-        "- **Aug 1992** — Hurricane Andrew, peak Atlantic season\n"
+        "- **Oct 2015** — Hurricane Patricia's month, record El Niño building (try SST anomaly)\n"
+        "- **Aug 1992** — Hurricane Andrew (Cat 5 Florida landfall, Aug 24)\n"
         "- **Jan 1998** — strong El Niño peak (try SST anomaly)\n"
-        "- **Jun 1991** — Pinatubo aftermath (try 2-m temp anomaly)"
+        "- **Jul 1992** — post-Pinatubo global cooling (try 2-m temp anomaly)"
     )
 
 C.render_footer(REPO_URL)

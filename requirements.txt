@@ -1,6 +1,6 @@
 streamlit>=1.33
 xarray
 netCDF4
-plotly
+plotly>=6
 numpy
 requests

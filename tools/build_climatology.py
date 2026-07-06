@@ -95,7 +95,7 @@ def build_for(dom: str, var: str, code: str, suffix: str, lvl: int | None,
     stack = xr.concat(arrs, dim="year")    # (year, month, lat, lon)
 
     mean = stack.mean("year", keep_attrs=True)
-    std  = stack.std("year",  keep_attrs=True)
+    std  = stack.std("year",  ddof=1, keep_attrs=True)  # sample std (n-1)
 
     vname_up = var.upper()
     out_ds = xr.Dataset({
