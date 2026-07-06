@@ -190,16 +190,20 @@ def find_var(ds: xr.Dataset, short: str) -> str:
 @st.cache_resource(show_spinner="Loading from RDA…", max_entries=6)
 def load_field_cached(url: str, vname: str, plevel: Optional[int],
                       decode_times: bool = True,
-                      time_sel: Optional[str] = None) -> xr.DataArray:
+                      time_sel: Optional[str] = None,
+                      day_sel: Optional[str] = None,
+                      stride: int = 1) -> xr.DataArray:
     """Open a remote dataset, slice the requested variable — and, crucially,
     the pressure level and/or time — BEFORE downloading, then eagerly load.
 
-    OPeNDAP translates the .sel() calls into server-side subsetting, so only
-    the requested slab crosses the network:
+    OPeNDAP translates the .sel()/.isel() calls into server-side subsetting,
+    so only the requested slab crosses the network:
       - monthly app: one year of one variable (~50 MB) → month scrubbing on
         the same year is instant in-memory slicing.
       - hourly app: pass `time_sel` (ISO string) to fetch a single hour
         (~4 MB) instead of a whole month of hourly data (~3 GB).
+      - animation: pass `day_sel` (ISO date) for all 24 hours of one day,
+        with `stride=2` to fetch at 0.5° (~25 MB instead of ~100 MB).
 
     Cached with st.cache_resource: the array is shared across reruns and
     sessions with NO per-rerun pickle/unpickle copy (all downstream ops
@@ -210,8 +214,13 @@ def load_field_cached(url: str, vname: str, plevel: Optional[int],
     da = ds[find_var(ds, vname)]
     if plevel is not None:
         da = da.sel(level=plevel)
-    if time_sel is not None:
+    if day_sel is not None:
+        da = da.sel(time=slice(f"{day_sel}T00:00", f"{day_sel}T23:59"))
+    elif time_sel is not None:
         da = da.sel(time=time_sel, method="nearest")
+    if stride > 1:
+        da = da.isel(latitude=slice(None, None, stride),
+                     longitude=slice(None, None, stride))
     return da.load().astype(np.float32)
 
 
@@ -301,7 +310,12 @@ def rescale_to_region(da: xr.DataArray,
         else:                            # box wraps the seam
             lon_mask = (lons >= lon_min) | (lons <= lon_max)
 
-    sub = vals[np.ix_(lat_mask, lon_mask)] if (lat_mask.any() and lon_mask.any()) else vals
+    # Ellipsis indexing keeps this correct for both 2-D (lat, lon) fields and
+    # 3-D (time, lat, lon) day cubes.
+    if lat_mask.any() and lon_mask.any():
+        sub = vals[..., lat_mask, :][..., :, lon_mask]
+    else:
+        sub = vals
     if sub.size == 0 or np.all(np.isnan(sub)):
         sub = vals
     qlo, qhi = np.nanquantile(sub, [quantile_lo, quantile_hi])
@@ -386,14 +400,8 @@ def colourbar_controls(da: xr.DataArray, show_anom: bool,
     data_min = float(np.nanmin(arr))
     data_max = float(np.nanmax(arr))
 
-    # An earlier Auto-scale click persists in session state, fingerprinted by
-    # the data range so it can't leak onto a different variable/month.
-    auto = st.session_state.get("_autoscale")
-    if override_default is None and auto and auto.get("fp") == (data_min, data_max):
-        override_default = auto["bounds"]
-
     if override_default is not None:
-        default_min, default_max = override_default
+        default_min, default_max = float(override_default[0]), float(override_default[1])
     elif show_anom:
         m = max(abs(data_min), abs(data_max))
         default_min, default_max = -m, m
@@ -406,19 +414,34 @@ def colourbar_controls(da: xr.DataArray, show_anom: bool,
     slider_max = max(data_max, default_max)
     step = (slider_max - slider_min) / 50 or 1e-6
 
+    # Streamlit keeps a keyed widget's stored value and IGNORES a changed
+    # `value=` parameter — so box-select / region-preset rescales would
+    # silently do nothing. Instead the sliders are driven purely through
+    # session state: whenever the thing that determines the defaults changes
+    # (new box, new preset, new field), push the new defaults in.
+    fp = ("override", default_min, default_max) if override_default is not None \
+         else ("data", data_min, data_max, bool(show_anom))
+    if st.session_state.get("_cbar_fp") != fp:
+        st.session_state["_cbar_fp"] = fp
+        st.session_state["cmin"] = default_min
+        st.session_state["cmax"] = default_max
+    # Clamp stale values (e.g. from a previous variable) into today's range.
+    st.session_state["cmin"] = min(max(st.session_state.get("cmin", default_min), slider_min), slider_max)
+    st.session_state["cmax"] = min(max(st.session_state.get("cmax", default_max), slider_min), slider_max)
+
+    if override_label:
+        st.sidebar.caption(f"🎯 {override_label}")
+
     with st.sidebar.expander("Colour-bar limits", expanded=False):
-        if override_label:
-            st.caption(override_label)
-        cmin = st.slider("Min", slider_min, slider_max, value=default_min,
+        cmin = st.slider("Min", slider_min, slider_max,
                          step=step, format="%.4g", key="cmin")
-        cmax = st.slider("Max", slider_min, slider_max, value=default_max,
+        cmax = st.slider("Max", slider_min, slider_max,
                          step=step, format="%.4g", key="cmax")
         if st.button("Auto-scale (98 % of data)", use_container_width=True):
             qmin, qmax = np.nanquantile(arr, [0.01, 0.99])
-            st.session_state["_autoscale"] = {
-                "bounds": (float(qmin), float(qmax)),
-                "fp": (data_min, data_max),
-            }
+            # Keep _cbar_fp as-is so the write survives the rerun.
+            st.session_state["cmin"] = float(qmin)
+            st.session_state["cmax"] = float(qmax)
             st.rerun()
 
     if cmin >= cmax:
@@ -525,6 +548,100 @@ def build_figure(da: xr.DataArray, title: str, units: str, cmap: str,
     return fig
 
 
+# ─────────── day animation ───────────────────────────────────────────────────
+def build_animation_figure(da_day: xr.DataArray, title: str, units: str,
+                           cmap: str, cmin: float, cmax: float,
+                           show_coast: bool, height: int = 580) -> go.Figure:
+    """24-frame animation of one day with client-side play/pause + hour slider.
+
+    Values are colormapped server-side through a 256-entry LUT and shipped as
+    PNG-compressed RGB frames (px.imshow binary_string), so a full day is a
+    few MB and playback never touches the server. An invisible scatter trace
+    carries the colorbar. Hover shows no data values in this mode — that's
+    the trade for a payload 20× smaller than raw arrays."""
+    import plotly.colors as pc
+
+    times = da_day.time.values
+    lats = da_day.latitude.values
+    lons = da_day.longitude.values
+    vals = da_day.values                      # (time, lat, lon)
+
+    # go.Image draws row i at y0 + i*dy — flip to ascending latitude so a
+    # positive dy puts north at the top on a normal (increasing-up) axis.
+    if lats[0] > lats[-1]:
+        lats = lats[::-1]
+        vals = vals[:, ::-1, :]
+
+    colorscale = pc.get_colorscale(cmap)
+    samples = pc.sample_colorscale(colorscale, np.linspace(0, 1, 256),
+                                   colortype="tuple")
+    lut = (np.asarray(samples) * 255).astype(np.uint8)         # (256, 3)
+
+    span = (cmax - cmin) or 1e-9
+    idx = (vals - cmin) / span * 255.0
+    bad = ~np.isfinite(idx)
+    idx8 = np.clip(np.where(bad, 0, idx), 0, 255).astype(np.uint8)
+    rgb = lut[idx8]                                            # (t, lat, lon, 3)
+    rgb[bad] = 235                                             # masked → light gray
+
+    fig = px.imshow(rgb, animation_frame=0, binary_string=True,
+                    binary_compression_level=6)
+
+    # Put the frames back into lon/lat coordinates so coastlines align.
+    x0, dx = float(lons[0]), float(lons[1] - lons[0])
+    y0, dy = float(lats[0]), float(lats[1] - lats[0])
+    fig.update_traces(x0=x0, dx=dx, y0=y0, dy=dy)
+    for fr in fig.frames:
+        for tr in fr.data:
+            tr.update(x0=x0, dx=dx, y0=y0, dy=dy)
+    fig.update_xaxes(autorange=True, title="", showgrid=False,
+                     zeroline=False, ticks="outside", constrain="domain")
+    fig.update_yaxes(autorange=True, title="", showgrid=False,
+                     zeroline=False, ticks="outside")
+
+    # Human labels on the frames + slider ("06:00 UTC", not "5").
+    labels = [np.datetime_as_string(tv, unit="h")[-2:] + ":00 UTC" for tv in times]
+    for fr, lab in zip(fig.frames, labels):
+        fr.name = lab
+    if fig.layout.sliders:
+        sl = fig.layout.sliders[0]
+        sl.currentvalue.prefix = ""
+        for step_, lab in zip(sl.steps, labels):
+            step_.label = lab[:5]
+            step_.args = ([lab], step_.args[1])   # args tuples are immutable
+
+    # Faster default playback; no easing between frames.
+    if fig.layout.updatemenus:
+        btn = fig.layout.updatemenus[0].buttons[0]
+        btn.args[1]["frame"]["duration"] = 180
+        btn.args[1]["transition"]["duration"] = 0
+
+    if show_coast:
+        fig.add_trace(coastlines_trace())
+
+    # Invisible scatter that carries the colorbar for the PNG frames.
+    fig.add_trace(go.Scatter(
+        x=[None], y=[None], mode="markers",
+        marker=dict(colorscale=colorscale, cmin=cmin, cmax=cmax,
+                    showscale=True,
+                    colorbar=dict(thickness=12, len=0.85, x=1.01,
+                                  outlinewidth=0, title=dict(text=units))),
+        hoverinfo="skip", showlegend=False,
+    ))
+
+    accent_text, _ = _theme_colors()
+    fig.update_layout(
+        height=height,
+        margin=dict(l=0, r=0, t=46, b=0),
+        paper_bgcolor="rgba(0,0,0,0)",
+        plot_bgcolor="rgba(0,0,0,0)",
+        title=dict(text=title, x=0.0, xanchor="left",
+                   font=dict(size=18, color=accent_text,
+                             family="Source Serif 4, Georgia, serif")),
+    )
+    return fig
+
+
 # ─────────── presentation ────────────────────────────────────────────────────
 SITE_URL = "https://langosmon.github.io"
 
@@ -551,6 +668,13 @@ _FONT_CSS = """
   h1, h2, h3 { font-family: "Source Serif 4", Georgia, serif; }
   code, pre, [data-testid="stMetricValue"] {
     font-family: "JetBrains Mono", ui-monospace, monospace;
+  }
+  /* Streamlit renders its UI icons (expander chevrons, etc.) as Material
+     Symbols ligatures — the blanket font rule above must NOT touch them,
+     or the icons degrade to raw text like "keyboard_double_arrow_right". */
+  [data-testid="stIconMaterial"],
+  span[class*="material-symbols"] {
+    font-family: "Material Symbols Rounded", "Material Symbols Outlined" !important;
   }
 </style>
 """
