@@ -40,7 +40,8 @@ import plotly.graph_objects as go
 SURFACE: dict[str, tuple] = {
     "Sea-surface temperature": ("sfc", "034", "sstk", "°C",     "thermal", "RdBu_r"),
     "CAPE":                    ("sfc", "059", "cape", "J kg⁻¹", "viridis", "PuOr"),
-    "Surface geopotential":    ("sfc", "129", "z",    "m² s⁻²", "magma",   "RdBu_r"),
+    # NOTE: no "Surface geopotential" — 128_129_z does not exist in
+    # e5.moda.an.sfc / e5.oper.an.sfc on RDA (it's an invariant field).
     "Surface pressure":        ("sfc", "134", "sp",   "hPa",    "icefire", "RdBu_r"),
     "Mean sea-level press.":   ("sfc", "151", "msl",  "hPa",    "icefire", "RdBu_r"),
     "10-m zonal wind":         ("sfc", "165", "10u",  "m s⁻¹",  "curl",    "RdBu_r"),
@@ -63,7 +64,7 @@ PRESSURE: dict[str, tuple] = {
     "Ozone":                 ("pl", "203", "o3", "kg kg⁻¹", "viridis", "RdBu_r"),
 }
 
-COMMON_PLEVELS: list[int] = [1000, 925, 850, 700, 500, 300, 250, 100, 50, 10]
+COMMON_PLEVELS: list[int] = [1000, 975, 925, 850, 700, 500, 300, 250, 100, 50, 10]
 
 
 # ─────────── REMOTE CLIMATOLOGY ──────────────────────────────────────────────
@@ -102,6 +103,9 @@ def _clim_dataset(domain: str, var: str, lvl: Optional[int]) -> xr.Dataset:
 
     if not local.exists():
         url = _clim_remote_url(domain, var, lvl)
+        # Download to a temp name and rename atomically so an interrupted
+        # transfer can never leave a truncated file that poisons the cache.
+        part = local.with_suffix(".part")
         try:
             r = requests.get(url, stream=True, timeout=30)
             if r.status_code != 200:
@@ -109,21 +113,42 @@ def _clim_dataset(domain: str, var: str, lvl: Optional[int]) -> xr.Dataset:
                     f"Climatology not yet uploaded to release '{CLIM_TAG}'.\n"
                     f"URL: {url}\nStatus: {r.status_code}"
                 )
-            with open(local, "wb") as f:
+            with open(part, "wb") as f:
                 for chunk in r.iter_content(1 << 16):
                     f.write(chunk)
+            part.replace(local)
         except requests.exceptions.RequestException as e:
+            part.unlink(missing_ok=True)
             raise FileNotFoundError(f"Could not reach climatology host: {e}") from e
+        except BaseException:
+            part.unlink(missing_ok=True)
+            raise
 
-    with xr.open_dataset(local) as ds:
-        return ds.load()
+    try:
+        with xr.open_dataset(local) as ds:
+            return ds.load()
+    except Exception:
+        # Corrupt file (e.g. legacy partial download) — drop it so the next
+        # run re-fetches instead of failing forever.
+        local.unlink(missing_ok=True)
+        raise
 
 
 def load_climatology(domain: str, var: str, lvl: Optional[int]) -> xr.DataArray:
     """Climatology mean in NATIVE units, already in memory — slicing by
     month is free."""
     ds = _clim_dataset(domain, var, lvl)
-    return ds[find_var(ds, var)]
+    da = ds[find_var(ds, var)]
+    # Guard the native-units contract: a climatology regenerated in display
+    # units would silently reintroduce the K-vs-°C offset bug.
+    u = str(da.attrs.get("units", "")).strip().lower()
+    if u in {"degc", "celsius", "°c", "hpa", "pvu"}:
+        raise ValueError(
+            f"Climatology for '{var}' is in converted units ({u!r}); the apps "
+            "expect ERA5 native units (K, Pa, SI). Rebuild with "
+            "tools/build_climatology.py without unit conversion."
+        )
+    return da
 
 
 def _find_std_name(ds: xr.Dataset) -> Optional[str]:
@@ -353,8 +378,19 @@ def colourbar_controls(da: xr.DataArray, show_anom: bool,
     the preset.
     `override_label`: optional small caption shown under the controls."""
     arr = da.values
+    if np.all(np.isnan(arr)):
+        # Fully masked field (e.g. SST + Land) — the app already explains
+        # why the map is empty; give the figure sane dummy bounds.
+        st.sidebar.info("Colour-bar disabled — the current mask leaves no data.")
+        return 0.0, 1.0
     data_min = float(np.nanmin(arr))
     data_max = float(np.nanmax(arr))
+
+    # An earlier Auto-scale click persists in session state, fingerprinted by
+    # the data range so it can't leak onto a different variable/month.
+    auto = st.session_state.get("_autoscale")
+    if override_default is None and auto and auto.get("fp") == (data_min, data_max):
+        override_default = auto["bounds"]
 
     if override_default is not None:
         default_min, default_max = override_default
@@ -379,8 +415,10 @@ def colourbar_controls(da: xr.DataArray, show_anom: bool,
                          step=step, format="%.4g", key="cmax")
         if st.button("Auto-scale (98 % of data)", use_container_width=True):
             qmin, qmax = np.nanquantile(arr, [0.01, 0.99])
-            st.session_state["cmin"] = float(qmin)
-            st.session_state["cmax"] = float(qmax)
+            st.session_state["_autoscale"] = {
+                "bounds": (float(qmin), float(qmax)),
+                "fp": (data_min, data_max),
+            }
             st.rerun()
 
     if cmin >= cmax:
@@ -430,11 +468,12 @@ def box_selection_to_bounds(event) -> Optional[tuple[float, float, float, float]
 
 # ─────────── statistical significance ────────────────────────────────────────
 def add_significance_stipple(fig: go.Figure, anom: xr.DataArray,
-                             std: xr.DataArray, z: float = 1.96,
+                             std: xr.DataArray, z: float = 2.04,
                              stride: int = 8) -> None:
-    """Overlay sparse dots where |anom| ≥ z·σ (≈95% confidence assuming
-    year-to-year normality). Subsamples BEFORE comparing, so the test runs on
-    1/stride² of the grid — same visual output, ~64× less work at stride=8.
+    """Overlay sparse dots where |anom| ≥ z·σ. Default z = t(0.975, 30) ≈ 2.04
+    (≈95% confidence for a 31-year base period, assuming year-to-year
+    normality). Subsamples BEFORE comparing, so the test runs on 1/stride² of
+    the grid — same visual output, ~64× less work at stride=8.
     Pass anom and std in the SAME units (both native or both converted)."""
     sub_a = anom.values[::stride, ::stride]
     sub_s = std.values[::stride, ::stride]
@@ -454,6 +493,7 @@ def add_significance_stipple(fig: go.Figure, anom: xr.DataArray,
 def build_figure(da: xr.DataArray, title: str, units: str, cmap: str,
                  cmin: float, cmax: float, show_coast: bool,
                  height: int = 560) -> go.Figure:
+    accent_text, _ = _theme_colors()
     fig = px.imshow(
         da,
         origin="lower",
@@ -474,7 +514,7 @@ def build_figure(da: xr.DataArray, title: str, units: str, cmap: str,
         title=dict(
             text=title,
             x=0.0, xanchor="left",
-            font=dict(size=18, color="#d97757",
+            font=dict(size=18, color=accent_text,
                       family="Source Serif 4, Georgia, serif"),
         ),
         xaxis=dict(title="", showgrid=False, zeroline=False, ticks="outside"),
@@ -487,6 +527,18 @@ def build_figure(da: xr.DataArray, title: str, units: str, cmap: str,
 
 # ─────────── presentation ────────────────────────────────────────────────────
 SITE_URL = "https://langosmon.github.io"
+
+
+def _theme_colors() -> tuple[str, str]:
+    """(accent_text, muted) for the ACTIVE theme, chosen to pass WCAG AA.
+    Falls back to the light pair on Streamlit versions without st.context.theme."""
+    try:
+        dark = st.context.theme.type == "dark"
+    except Exception:
+        dark = False
+    if dark:
+        return "#e08c66", "#9aa0a6"   # ≥ 5:1 on Streamlit's dark background
+    return "#a85028", "#5f6368"       # ≥ 4.5:1 on white / warm paper
 
 _FONT_CSS = """
 <link rel="preconnect" href="https://fonts.googleapis.com">
@@ -518,6 +570,7 @@ def configure_page(title: str, subtitle: str | None = None,
         },
     )
     st.markdown(_FONT_CSS, unsafe_allow_html=True)
+    accent_text, muted = _theme_colors()
     st.markdown(
         f"""
         <div style='display:flex; justify-content:space-between; align-items:baseline;
@@ -526,15 +579,15 @@ def configure_page(title: str, subtitle: str | None = None,
           <div>
             <div style='font-family:"JetBrains Mono",monospace; font-size:11px;
                         letter-spacing:0.16em; text-transform:uppercase;
-                        color:#d97757;'>ERA5 · NCAR RDA</div>
+                        color:{accent_text};'>ERA5 · NCAR RDA</div>
             <div style='font-family:"Source Serif 4",Georgia,serif; font-size:24px;
                         line-height:1.1; margin-top:4px;'>{title}</div>
-            {('<div style="font-size:13px; color:#888; margin-top:4px;">'
+            {('<div style="font-size:13px; color:' + muted + '; margin-top:4px;">'
               f'{subtitle}</div>') if subtitle else ''}
           </div>
           <div style='font-family:"JetBrains Mono",monospace; font-size:10px;
-                      letter-spacing:0.08em; color:#888;'>
-            <a href='{SITE_URL}' target='_blank' style='color:#d97757;
+                      letter-spacing:0.08em; color:{muted};'>
+            <a href='{SITE_URL}' target='_blank' style='color:{accent_text};
                 text-decoration:none;'>langosmon.github.io ↗</a>
           </div>
         </div>
@@ -544,19 +597,20 @@ def configure_page(title: str, subtitle: str | None = None,
 
 
 def render_footer(repo_url: str) -> None:
+    accent_text, muted = _theme_colors()
     st.markdown(
         f"""
         <div style='margin-top:32px; padding-top:14px;
                     border-top:1px solid rgba(128,128,128,0.18);
-                    font-size:12px; color:#888; display:flex; gap:16px;
+                    font-size:12px; color:{muted}; display:flex; gap:16px;
                     flex-wrap:wrap; justify-content:space-between;'>
           <span>Plot built from ERA5 via NCAR's
-            <a href='https://rda.ucar.edu/' target='_blank' style='color:#d97757;'>RDA</a>.
+            <a href='https://rda.ucar.edu/' target='_blank' style='color:{accent_text};'>RDA</a>.
           </span>
           <span>
-            <a href='{repo_url}' target='_blank' style='color:#d97757; text-decoration:none;'>source ↗</a>
+            <a href='{repo_url}' target='_blank' style='color:{accent_text}; text-decoration:none;'>source ↗</a>
             ·
-            <a href='{SITE_URL}' target='_blank' style='color:#d97757; text-decoration:none;'>site ↗</a>
+            <a href='{SITE_URL}' target='_blank' style='color:{accent_text}; text-decoration:none;'>site ↗</a>
           </span>
         </div>
         """,

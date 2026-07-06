@@ -42,7 +42,8 @@ st.sidebar.header("Display")
 show_anom  = st.sidebar.toggle("Anomaly (value − climatology)", value=False)
 show_sig   = st.sidebar.toggle("Mark statistically significant", value=False,
                                disabled=not show_anom,
-                               help="Stipples points where |anomaly| ≥ 1.96·σ, "
+                               help="Stipples points where |anomaly| ≥ 2.04·σ "
+                                    "(t-test at ≈95% for a 31-year base period), "
                                     "with σ the 1980–2010 interannual std dev "
                                     "of the monthly mean (approximate; assumes "
                                     "Gaussian year-to-year variability). "
@@ -109,7 +110,7 @@ if show_anom:
                     "GitHub Release to enable this overlay."
                 )
                 show_sig = False
-    except FileNotFoundError as e:
+    except Exception as e:
         st.warning(f"Climatology unavailable for this field — showing absolute value instead.\n\n{e}")
         show_anom = False
         cmap = cmap_abs
@@ -180,7 +181,7 @@ if mask_mode != "All": title += f" · {mask_mode.lower()} only"
 fig = C.build_figure(da, title, units, cmap, cmin, cmax, show_coast, height=580)
 
 if show_anom and show_sig and clim_std is not None:
-    C.add_significance_stipple(fig, da, clim_std, z=1.96, stride=8)
+    C.add_significance_stipple(fig, da, clim_std, stride=8)
 
 # Box-select on the plot = "rescale colour-bar to this region".
 st.plotly_chart(

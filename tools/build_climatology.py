@@ -32,7 +32,7 @@ import xarray as xr
 SURFACE = {  # short → (code, ll-suffix)
     "sstk": ("034", "sc"),
     "cape": ("059", "sc"),
-    "z":    ("129", "sc"),
+    # no surface "z" — 128_129_z does not exist in e5.moda.an.sfc on RDA
     "sp":   ("134", "sc"),
     "msl":  ("151", "sc"),
     "10u":  ("165", "sc"),
@@ -54,7 +54,7 @@ PRESSURE = {
     "o3": ("203", "sc"),
 }
 
-PLEVELS = [975, 850, 700, 500, 250, 100, 50, 10]
+PLEVELS = [1000, 975, 925, 850, 700, 500, 300, 250, 100, 50, 10]
 
 
 def rda_monthly_url(year: int, dom: str, code: str, var: str, suffix: str) -> str:
@@ -104,6 +104,8 @@ def build_for(dom: str, var: str, code: str, suffix: str, lvl: int | None,
     })
     out_ds.attrs["base_period"] = f"{min(years)}-{max(years)}"
     out_ds.attrs["history"] = "Built by tools/build_climatology.py (mean + year-to-year std)."
+    # Preserve the source units attr — the apps assert the native-units contract.
+    out_ds.attrs["units_convention"] = "ERA5 native (K, Pa, SI)"
 
     out.parent.mkdir(parents=True, exist_ok=True)
     out_ds.to_netcdf(out)
